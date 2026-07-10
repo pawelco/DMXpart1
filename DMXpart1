@@ -1,0 +1,2825 @@
+package com.example.dmx
+
+import android.content.res.ColorStateList
+import android.content.Context
+import android.graphics.Color
+import android.graphics.drawable.GradientDrawable
+import android.os.Bundle
+import android.view.Gravity
+import android.view.View
+import android.view.WindowManager
+import android.widget.*
+import android.view.ViewGroup
+import androidx.appcompat.app.AppCompatActivity
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.cancel
+
+class MainActivity : AppCompatActivity() {
+
+    external fun startEngine(dataDir: String)
+    external fun tickEngine(dt: Double)
+    external fun setDmxChannel(channel: Int, value: Int)
+    external fun pressButton(buttonId: Int)
+
+    init { System.loadLibrary("dmx") }
+
+    // ========================================================
+    // GLOBAL MEMORY & PERSISTENCE
+    // ========================================================
+    companion object {
+        val dmxValues = IntArray(512) { 0 }
+        val channelMappings = Array(8) { Array(512) { "" } }
+        val groupNames = arrayOf("Group A", "Group B", "Group C", "Group D", "Group E", "Group F", "Group G", "Group H")
+        val auxProtectedChannels = BooleanArray(512) { false }
+        val presetDmxValues = IntArray(512) { 0 } // wartości po nałożeniu presetów, przed LFO/SEQ
+        val effectManagedChannels = BooleanArray(512) { false }
+        val groupRouting = IntArray(8) { 0 }  // 0=MAIN, 1=AUX
+        var gyroEnabled = false
+        var firstLaunchDone = false
+        val dmxScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+        var engineRunning = false
+
+        val seqFadeOutActive   = BooleanArray(4) { false }
+        val seqFadeOutTimer    = FloatArray(4)   { 0f }
+        val seqFadeOutDuration = FloatArray(4)   { 0f }
+
+        val lfoOutputValues = IntArray(512) { 0 }
+        val seqOutputValues = IntArray(512) { 0 }
+        val lfoCurrentPhases = FloatArray(4) { 0f }
+        val fxBaseSpeeds = FloatArray(4) { 0.5f }
+        val fxBaseAmts   = IntArray(4)   { 100 }
+        val fxBasePhss   = IntArray(4)   { 0 }
+        val fxAmtStart   = IntArray(4)   { 100 }  // AMT sprzed recall – do interpolacji fade
+        val fxFadeTimer  = FloatArray(4) { 1f }
+        val fxFadeTime   = FloatArray(4) { 0f }
+        val fxDisableDelay = FloatArray(4) { 0f }  // pozostały czas do wyłączenia FX
+
+        val presetBankNames  = Array(4) { "BANK ${it+1}" }
+        val presetBankColors = IntArray(4) { -7829368 }  // Color.parseColor("#888888") – stała, bo Color niedostępny w companion init
+        val exBankNames      = Array(4) { "BANK ${it+1}" }
+        val exBankColors     = IntArray(4) { -7829368 }
+
+
+        // ================================================================
+// FX SYSTEM – do dodania w companion object
+// ================================================================
+
+        // Kolory 4 slotów FX (zielono-turkusowe, żeby nie mylić z LFO/SEQ)
+        class FxData {
+            var shapeIdx  = 0
+            var speed     = 0.5f
+            var isSync    = false
+            var syncIdx   = 8   // "1" beat w nowej liście bez STATIC
+            var spread    = 4
+            var amt       = 100
+            var phs       = 0
+            var groupIdx  = 0
+            var destIdx   = -1
+            var playState = 0
+            var phase     = 0f
+            var prevDestIdx   = -1
+            var prevGroupIdx  = -1
+            var isEnabled = false
+        }
+
+        val memoryFx = Array(4) { FxData() }
+
+        val fxColors = listOf(
+            Color.parseColor("#00BB44"), Color.parseColor("#00AA66"),
+            Color.parseColor("#009988"), Color.parseColor("#0088AA")
+        )
+
+
+        fun clearUnusedEffectChannels() {
+            for (i in 0..511) {
+                if (Companion.effectManagedChannels[i]) {
+                    // Sprawdź czy jakikolwiek aktywny SEQ/LFO nadal zarządza tym kanałem
+                    // Jeśli żaden SEQ nie jest aktywny – zwolnij
+                    var anyActive = false
+                    for (si in 0..3) {
+                        if (seqEnabled[si] || lfoEnabled[si]) { anyActive = true; break }
+                    }
+                    if (!anyActive) effectManagedChannels[i] = false
+                }
+            }
+        }
+
+
+
+        // ── Kolory efektów ──────────────────────────────────
+        val lfoColors = listOf(
+            Color.parseColor("#FFDD00"), Color.parseColor("#FFAA00"),
+            Color.parseColor("#FF6600"), Color.parseColor("#FF0000")
+        )
+        val seqColors = listOf(
+            Color.parseColor("#00AAFF"), Color.parseColor("#0055FF"),
+            Color.parseColor("#0022AA"), Color.parseColor("#8800FF")
+        )
+
+        // ── Stan LFO/SEQ ────────────────────────────────────
+        val lfoEnabled = BooleanArray(4) { false }
+        val seqEnabled = BooleanArray(4) { false }
+        val lfoGroupActive = Array(4) { BooleanArray(8) { false } }
+        val seqGroupActive = Array(4) { BooleanArray(8) { false } }
+        val posManualOverride = BooleanArray(8) { false }
+        val colorManualOverride = BooleanArray(8) { false }
+        val posSmoothedValues = FloatArray(512) { -1f }
+        val posPanOffset = FloatArray(8) { 0f }
+        val posTiltOffset = FloatArray(8) { 0f }
+        val posFadeActiveSinceReset = BooleanArray(8) { false }
+        val effectFlagsLock = Any()
+        val engineLock = Any()
+        var stopSeqActive = false
+        val stopSeqEnabled = BooleanArray(4) { false }
+        val stopLfoEnabled = BooleanArray(4) { false }
+
+        // ── LfoData / SeqData ───────────────────────────────
+        class LfoData {
+            var shapeIdx = 0; var rate = 0.5f; var isSync = false; var syncIdx = 7; var pwm = 50
+            val fix = IntArray(4) { -1 }; val dest = IntArray(4) { -1 }
+            val amt = IntArray(4) { 0 }; val fad = IntArray(4) { 25 }
+            val off = IntArray(4) { 0 }; val phs = IntArray(4) { 0 }
+            var phase = 0.0f; var currentValue = 0.0f
+            val destSmoothed = FloatArray(4) { 0.0f }
+            val fixSmoothed = Array(4) { FloatArray(64) { 0.0f } }
+        }
+
+        class SeqData {
+            var justReset = false
+            var totalSteps = 2; var globalTime = 2.0f; var isSync = false
+            var syncIdx = 7; var globalFade = 25; var globalPhase = 0
+            val stepSnap = IntArray(16) { 0 }
+            val stepType = IntArray(16) { 0 }
+            val stepValue = IntArray(16) { 0 }
+            val stepTime = FloatArray(16) { 0f }
+            val stepFade = IntArray(16) { -1 }
+            val stepIsSync = BooleanArray(16) { false }
+            val stepSyncIdx = IntArray(16) { 7 }
+            var currentStep = 0; var stepTimer = 0.0f; var prevStep = 0
+        }
+
+        val memoryLfo = Array(4) { LfoData() }
+        val memorySeq = Array(4) { SeqData() }
+        var activeLfoSlot = -1
+        var activeSeqSlot = -1
+        val dmxPersist = FloatArray(512) { 0f }
+        var masterBpm = 120f
+        val tapTimestamps = mutableListOf<Long>()
+        val lfoBeatAccum = DoubleArray(4) { 0.0 }
+        val seqBeatAccum = DoubleArray(4) { 0.0 }
+        // Routing urządzeń per grupa dla sekwencerów: kolejność + włącznik
+        val seqRoutingOrder = Array(8) { mutableListOf<Int>() }
+        val seqRoutingOn    = Array(8) { mutableListOf<Boolean>() }
+        val seqRoutingMode  = IntArray(8) { 0 }  // 0=SEQ, 1=PATT
+        val fixtureOriginalGroup = java.util.concurrent.ConcurrentHashMap<Int, Int>()
+        val fixturePatternSnapshot = java.util.concurrent.ConcurrentHashMap<Int, IntArray>()
+        val seqActivePattern = IntArray(8) { -1 }
+
+        data class SeqPattern(
+            var isSaved: Boolean = false,
+            var name: String = "Empty",
+            val order: MutableList<Int> = mutableListOf(),
+            val onList: MutableList<Boolean> = mutableListOf()
+        )
+        val seqPatternMemories = Array(8) { Array(6) { SeqPattern() } }
+
+
+
+        val seqDirection = IntArray(4) { 1 }
+        val seqPingPongDirection = IntArray(4) { 1 }
+        val seqPingPongJustBounced = BooleanArray(4) { false }
+        val seqPingPongPos = LongArray(4) { 0L }
+
+        // ── EX-preset fade engine ───────────────────────────
+        val exFadeTimers = FloatArray(64) { 0f }
+        val exFadeStart = Array(64) { IntArray(4) { 0 } }
+        val exPrevActive = BooleanArray(64) { false }
+        val exFadingOut = BooleanArray(64) { false }
+        val exFadeOutTimers = FloatArray(64) { 0f }
+        val exFadeOutStart = Array(64) { IntArray(4) { 0 } }
+
+        val exSpecialSnapVal = Array(64) { FloatArray(4) }
+        val exSpecialSnapSync = Array(64) { BooleanArray(4) }
+        val exSpecialSnapSyncIdx = Array(64) { IntArray(4) }
+
+
+        fun updateAuxProtectedChannels() {
+            auxProtectedChannels.fill(false)
+            // Znajdź aktywny preset AUX
+            val auxIdx = (0 until 64).firstOrNull {
+                memoryPresets[it].isSaved && memoryPresets[it].presetTarget == 1
+            } ?: return
+            val auxPreset = memoryPresets[auxIdx]
+            // Oznacz kanały grup AUX jako chronione
+            fixturesList.forEach { fix ->
+                val isAuxGroup = !auxPreset.groupMask[fix.groupIdx]
+                if (isAuxGroup) {
+                    for (ch in 0 until fix.channels) {
+                        val addr = fix.dmx - 1 + ch
+                        if (addr in 0..511) auxProtectedChannels[addr] = true
+                    }
+                }
+            }
+        }
+
+        data class FixtureItem(
+            var id: Int, var name: String, var groupIdx: Int, var dmx: Int, var channels: Int,
+            var paramMap: Array<String>, var paramMin: IntArray, var paramMax: IntArray,
+            var cwCount: Int, var cwDmx: IntArray, var cwHalfDmx: IntArray, var cwColors: IntArray
+        )
+
+        data class PresetItem(
+            var isSaved: Boolean = false,
+            var name: String = "Empty",
+            var dmxSnapshot: IntArray = IntArray(512) { 0 },
+            var colorIdx: Int = 31,
+            var fadeTime: Int = 10,
+            var useExMemory: Boolean = false,
+            var exFix: IntArray = IntArray(4) { -1 },
+            var exDest: IntArray = IntArray(4) { -1 },
+            var exVal: IntArray = IntArray(4) { 0 },
+            var exIsSync: BooleanArray = BooleanArray(4) { false },
+            var exSyncIdx: IntArray = IntArray(4) { 0 },
+            var exMask: BooleanArray = BooleanArray(64) { false },
+            var groupMask: BooleanArray = BooleanArray(8) { true },
+            var presetTarget: Int = 0,
+            var lfoEnabledMask: BooleanArray = BooleanArray(4) { false },
+            var seqEnabledMask: BooleanArray = BooleanArray(4) { false },
+            var lfoMatrix: Array<BooleanArray> = Array(4) { BooleanArray(8) { false } },
+            var seqMatrix: Array<BooleanArray> = Array(4) { BooleanArray(8) { false } },
+            // Parametry LFO (4 LFO × dane)
+            var lfoShapes: IntArray = IntArray(4) { 0 },
+            var lfoRates: FloatArray = FloatArray(4) { 0.5f },
+            var lfoSyncs: BooleanArray = BooleanArray(4) { false },
+            var lfoSyncIdxs: IntArray = IntArray(4) { 7 },
+            var lfoPwms: IntArray = IntArray(4) { 50 },
+            var lfoFix: Array<IntArray> = Array(4) { IntArray(4) { -1 } },
+            var lfoDest: Array<IntArray> = Array(4) { IntArray(4) { -1 } },
+            var lfoAmt: Array<IntArray> = Array(4) { IntArray(4) { 0 } },
+            var lfoFad: Array<IntArray> = Array(4) { IntArray(4) { 25 } },
+            var lfoOff: Array<IntArray> = Array(4) { IntArray(4) { 0 } },
+            var lfoPhs: Array<IntArray> = Array(4) { IntArray(4) { 0 } },
+            // SEQ parametry
+            var seqTotalSteps: IntArray = IntArray(4) { 2 },
+            var seqGlobalTimes: FloatArray = FloatArray(4) { 2.0f },
+            var seqIsSyncs: BooleanArray = BooleanArray(4) { false },
+            var seqSyncIdxs: IntArray = IntArray(4) { 7 },
+            var seqGlobalFades: IntArray = IntArray(4) { 25 },
+            var seqGlobalPhases: IntArray = IntArray(4) { 0 },
+            var seqStepTypes: Array<IntArray> = Array(4) { IntArray(16) { 0 } },
+            var seqStepValues: Array<IntArray> = Array(4) { IntArray(16) { 0 } },
+            var seqStepTimes: Array<FloatArray> = Array(4) { FloatArray(16) { 0f } },
+            var seqStepFades: Array<IntArray> = Array(4) { IntArray(16) { -1 } },
+            var seqStepIsSyncs: Array<BooleanArray> = Array(4) { BooleanArray(16) { false } },
+            var seqStepSyncIdxs: Array<IntArray> = Array(4) { IntArray(16) { 7 } },
+            var extColorPaletteIdx: Int = 0,
+            var extColorRouting: Int = 0,
+            var useFxMemory: Boolean = true,
+            var fxEnabled: BooleanArray = BooleanArray(4) { false },
+            var fxIsSync: BooleanArray = BooleanArray(4) { false },
+            var fxSyncIdx: IntArray = IntArray(4) { 6 },
+            var fxPlayState: IntArray = IntArray(4) { 0 },
+            var fxShapeIdx: IntArray = IntArray(4) { 0 },
+            var fxSpeed: FloatArray = FloatArray(4) { 0.5f },
+            var fxSpread: IntArray = IntArray(4) { 4 },
+            var fxAmt: IntArray = IntArray(4) { 100 },
+            var fxPhs: IntArray = IntArray(4) { 0 },
+            var fxGroupIdx: IntArray = IntArray(4) { 0 },
+            var fxDestIdx: IntArray = IntArray(4) { -1 },
+            var fxSpdLfoIdx: IntArray = IntArray(4) { -1 },
+            var fxAmtLfoIdx: IntArray = IntArray(4) { -1 },
+            var fxPhsLfoIdx: IntArray = IntArray(4) { -1 },
+            var seqActivePatterns: IntArray = IntArray(8) { -1 },
+            var seqRoutingModes: IntArray = IntArray(8) { 0 }
+        )
+
+        // ── EXT color ───────────────────────────────────────
+        val extColorDmxValues = IntArray(6) { 0 }  // R,G,B,W,A,UV
+        var extColorPaletteIdx = 0
+        var extColorRouting = 0  // 0=direct/EXT, 1=SEQ1, 2=SEQ2, 3=SEQ3, 4=SEQ4
+
+
+
+        val fixturesList = mutableListOf(
+            FixtureItem(1, "Fixture 1", 0, 1, 16, Array(512){""}, IntArray(512){0}, IntArray(512){255}, 1, IntArray(32){0}, IntArray(32){0}, IntArray(32){0})
+        )
+
+        // Rozdzielona pamiec dla dwoch niezaleznych bankow po 64
+        val memoryPresets = Array(64) { PresetItem() }
+        val memoryExPresets = Array(64) { PresetItem() }
+
+        val activeExPresets = BooleanArray(64) { false }
+        val baseDmxValues = IntArray(512) { 0 }
+
+        // --- FADE ENGINE MEMORY ---
+        val baseDmxStart = IntArray(512) { 0 }
+        val baseDmxTarget = IntArray(512) { 0 }
+        var currentFadeTime = 0.0f
+        var currentFadeTimer = 0.0f
+        var isFading = false
+        // Osobne fade'y dla MAIN i AUX
+        val baseDmxStartMain = IntArray(512) { 0 }
+        val baseDmxStartAux  = IntArray(512) { 0 }
+        var currentFadeTimeMain = 0f;  var currentFadeTimerMain = 0f;  var isFadingMain = false
+        var currentFadeTimeAux  = 0f;  var currentFadeTimerAux  = 0f;  var isFadingAux  = false
+        val channelCanFade = BooleanArray(512) { true }
+
+        fun updateFadeMask() {
+            for (i in 0 until 512) channelCanFade[i] = true
+            fixturesList.forEach { fix ->
+                for (ch in 0 until fix.channels) {
+                    val p = fix.paramMap[ch]
+                    // Zabezpieczenie mechaniki lamp: Gobo, Kolory, Pryzmaty i Shutter robia twardy SNAP!
+                    if (p.contains("Gobo") || p.contains("Col. wheel") || p.contains("Prizm") || p.contains("Macro") || p.contains("FX") || p == "Shutter" || p == "PT speed" || p == "Other") {
+                        val actCh = fix.dmx - 1 + ch
+                        if (actCh in 0..511) channelCanFade[actCh] = false
+                    }
+                }
+            }
+        }
+
+        fun overrideChannel(ch: Int, value: Int) {
+            baseDmxValues[ch] = value
+            baseDmxTarget[ch] = value
+            baseDmxStart[ch] = value
+        }
+        // --------------------------
+
+        data class TouchedParam(var fixId: Int = -1, var destIdx: Int = -1, var lastVal: Int = 0)
+        val lastTouchedParams = Array(4) { TouchedParam() }
+
+        fun registerTouchedParam(fixId: Int, destIdx: Int, value: Int) {
+            if (fixId == -1 || destIdx == -1) return
+            val existingIdx = lastTouchedParams.indexOfFirst { it.fixId == fixId && it.destIdx == destIdx }
+            if (existingIdx != -1) {
+                val item = lastTouchedParams[existingIdx]
+                item.lastVal = value
+                for (i in existingIdx downTo 1) lastTouchedParams[i] = lastTouchedParams[i-1]
+                lastTouchedParams[0] = item
+            } else {
+                for (i in 3 downTo 1) lastTouchedParams[i] = lastTouchedParams[i-1]
+                lastTouchedParams[0] = TouchedParam(fixId, destIdx, value)
+            }
+        }
+
+        data class FixtureProfile(
+            val name: String, val channels: Int,
+            val paramMap: Array<String>, val paramMin: IntArray, val paramMax: IntArray,
+            val cwCount: Int, val cwDmx: IntArray, val cwHalfDmx: IntArray, val cwColors: IntArray
+        )
+
+        data class PositionItem(
+            var isSaved: Boolean = false,
+            var name: String = "Empty",
+            var dmxSnapshot: IntArray = IntArray(512) { 0 }
+        )
+        val positionMemories = Array(8) { Array(16) { PositionItem() } }
+
+        val savedProfiles = mutableListOf<FixtureProfile>()
+
+        fun saveProfilesToDisk(dir: String) {
+            try {
+                val jsonArray = JSONArray()
+                for (p in savedProfiles) {
+                    val obj = JSONObject()
+                    obj.put("name", p.name); obj.put("channels", p.channels)
+                    val pMap = JSONArray(); for (s in p.paramMap) pMap.put(s); obj.put("paramMap", pMap)
+                    val pMin = JSONArray(); for (m in p.paramMin) pMin.put(m); obj.put("paramMin", pMin)
+                    val pMax = JSONArray(); for (m in p.paramMax) pMax.put(m); obj.put("paramMax", pMax)
+                    obj.put("cwCount", p.cwCount)
+                    val pCwDmx = JSONArray(); for (m in p.cwDmx) pCwDmx.put(m); obj.put("cwDmx", pCwDmx)
+                    val pCwHDmx = JSONArray(); for (m in p.cwHalfDmx) pCwHDmx.put(m); obj.put("cwHalfDmx", pCwHDmx)
+                    val pCwC = JSONArray(); for (m in p.cwColors) pCwC.put(m); obj.put("cwColors", pCwC)
+                    jsonArray.put(obj)
+                }
+                File(dir, "profiles.json").writeText(jsonArray.toString())
+            } catch (e: Exception) { e.printStackTrace() }
+        }
+
+        fun loadProfilesFromDisk(dir: String) {
+            try {
+                val file = File(dir, "profiles.json")
+                if (!file.exists()) return
+                val jsonStr = file.readText()
+                val jsonArray = JSONArray(jsonStr)
+                savedProfiles.clear()
+
+                for (i in 0 until jsonArray.length()) {
+                    val obj = jsonArray.getJSONObject(i)
+                    val name = obj.getString("name")
+                    val channels = obj.getInt("channels")
+
+                    val pMapArr = obj.getJSONArray("paramMap")
+                    val paramMap = Array(512) { "" }
+                    for (j in 0 until pMapArr.length()) paramMap[j] = pMapArr.getString(j)
+
+                    val pMinArr = obj.getJSONArray("paramMin")
+                    val paramMin = IntArray(512) { 0 }
+                    for (j in 0 until pMinArr.length()) paramMin[j] = pMinArr.getInt(j)
+
+                    val pMaxArr = obj.getJSONArray("paramMax")
+                    val paramMax = IntArray(512) { 255 }
+                    for (j in 0 until pMaxArr.length()) paramMax[j] = pMaxArr.getInt(j)
+
+                    val cwCount = if (obj.has("cwCount")) obj.getInt("cwCount") else 1
+
+                    val cwDmx = IntArray(32){0}
+                    if (obj.has("cwDmx")) { val arr = obj.getJSONArray("cwDmx"); for (j in 0 until arr.length()) cwDmx[j] = arr.getInt(j) }
+
+                    val cwHDmx = IntArray(32){0}
+                    if (obj.has("cwHalfDmx")) { val arr = obj.getJSONArray("cwHalfDmx"); for (j in 0 until arr.length()) cwHDmx[j] = arr.getInt(j) }
+
+                    val cwC = IntArray(32){0}
+                    if (obj.has("cwColors")) { val arr = obj.getJSONArray("cwColors"); for (j in 0 until arr.length()) cwC[j] = arr.getInt(j) }
+
+                    savedProfiles.add(FixtureProfile(name, channels, paramMap, paramMin, paramMax, cwCount, cwDmx, cwHDmx, cwC))
+                }
+            } catch (e: Exception) { e.printStackTrace() }
+        }
+
+        val syncNames = listOf("STATIC","1/64","1/32","1/16","1/8","1/6","1/4","1/3","1/2","1","2","3","4")
+        val paramList = listOf(
+            "Clear", "Dimmer", "Pan", "Pan Fine", "Tilt", "Tilt Fine", "Zoom", "PT speed", "Focus", "Iris",
+            "Shutter", "Gobo", "Gobo rot", "Gobo2", "Gobo2 rot", "Prizm", "Prizm rot",
+            "Red", "Green", "Blue", "White", "Amber", "UV",
+            "Col. wheel", "FX 1", "FX 1 SPD", "FX 2", "FX 2 SPD", "FX 3", "FX 3 SPD", "FX 4", "FX 4 SPD",
+            "Macro 1", "Macro 2", "Macro 3", "Macro 4",
+            "Beam 1R", "Beam 1G", "Beam 1B", "Beam 1W", "Beam 1A",
+            "Beam 2R", "Beam 2G", "Beam 2B", "Beam 2W", "Beam 2A",
+            "Beam 3R", "Beam 3G", "Beam 3B", "Beam 3W", "Beam 3A",
+            "Beam 4R", "Beam 4G", "Beam 4B", "Beam 4W", "Beam 4A",
+            "Beam 5R", "Beam 5G", "Beam 5B", "Beam 5W", "Beam 5A",
+            "Beam 6R", "Beam 6G", "Beam 6B", "Beam 6W", "Beam 6A",
+            "Beam 7R", "Beam 7G", "Beam 7B", "Beam 7W", "Beam 7A",
+            "Beam 8R", "Beam 8G", "Beam 8B", "Beam 8W", "Beam 8A",
+            "Beam 9R", "Beam 9G", "Beam 9B", "Beam 9W", "Beam 9A",
+            "Beam 10R", "Beam 10G", "Beam 10B", "Beam 10W", "Beam 10A",
+            "Gobo shake", "Gobo2 shake", "Frost", "Other","FX_SPD", "FX_AMT", "FX_PHS"
+        )
+
+        // ── MIDI ────────────────────────────────────────────
+        const val MIDI_CC_ABS = 0
+        const val MIDI_CC_REL = 1
+        const val MIDI_NOTE   = 2
+        const val MIDI_PC     = 3
+
+        data class MidiMapping(
+            var type:    Int    = 0,
+            var channel: Int    = 0,
+            var number:  Int    = 0,
+            var target:  String = "",
+            var minVal:  Int    = 0,
+            var maxVal:  Int    = 127,
+            var relSens: Float  = 1.0f
+        )
+
+        class PerfButtonSettings {
+            var isToggleMode = false
+            var isActive = false
+            var value = 255
+            var fadeIn = 0f
+            var fadeOut = 0f
+            val groupMask = BooleanArray(8) { true }
+            val dmxSnapshot = IntArray(512) { 0 }
+            var fadeTimer = 0f
+            var wasActivePrev = false
+            val savedLfoMatrix = Array(4) { BooleanArray(8) }
+            val savedSeqMatrix = Array(4) { BooleanArray(8) }
+            val savedFxPlayState = IntArray(4) { -1 }
+            val savedLfoEnabled = BooleanArray(4) { false }
+        }
+        val perfSettings = Array(8) { PerfButtonSettings() }
+        var perfTempoMultiplier = 1f
+        val perfGroupTempoMult = FloatArray(8) { 1f }
+
+        val midiMappings    = mutableListOf<MidiMapping>()
+        var midiLearnActive = false
+        var midiLearnTarget = ""
+        var midiLearnType   = 0
+        var midiLearnUISelect = false
+        val midiDeviceNames = mutableListOf<String>()
+
+
+        val corePaletteColors = IntArray(64)
+
+        fun getPaletteDmxValues(i: Int): IntArray {
+            var r=0; var g=0; var b=0; var w=0; var a=0; var uv=0
+            when {
+                i == 63 -> { /* czarny – zaślepka, wszystko 0 */ }
+                i == 0 -> { w = 255 }
+                i == 31 -> { r=255; g=255; b=255; w=255; a=255 }
+                i in 1..30 -> { val c=corePaletteColors[i]; r=Color.red(c); g=Color.green(c); b=Color.blue(c) }
+                i in 32..47 -> { val c=corePaletteColors[i]; r=Color.red(c); g=Color.green(c); b=Color.blue(c); w=120 }
+                i in 48..62 -> {
+                    val col=i-48; val ratio=col/15.0f
+                    val rr=(255+(200-255)*ratio).toInt(); val gg=(160+(220-160)*ratio).toInt(); val bb=(80+(255-80)*ratio).toInt()
+                    w=(255*(1.0f-Math.abs(col-7.5f)/7.5f)).toInt().coerceIn(0,255)
+                    val blend=w/255.0f
+                    r=(rr+(255-rr)*blend).toInt().coerceIn(0,255); g=(gg+(255-gg)*blend).toInt().coerceIn(0,255); b=(bb+(255-bb)*blend).toInt().coerceIn(0,255)
+                }
+            }
+            return intArrayOf(r, g, b, w, a, uv)
+        }
+
+        fun rgbwaToUiColor(r:Int,g:Int,b:Int,w:Int,a:Int,uv:Int): Int {
+            val br = (r + w/2 + a).coerceAtMost(255)
+            val bg = (g + w/2 + a/2).coerceAtMost(255)
+            val bb = (b + w/2 + uv).coerceAtMost(255)
+            val mx = maxOf(br, bg, bb)
+            if (mx == 0) return Color.BLACK
+            return Color.rgb((br*255/mx).coerceAtMost(255), (bg*255/mx).coerceAtMost(255), (bb*255/mx).coerceAtMost(255))
+        }
+
+        var currentGroup = 0
+        var currentSliderPage = 0
+        var isFixtureMode = false
+        var currentFixture = 1
+
+        var fixturesViewState = 0
+        var editingFixtureIndex = -1
+
+        var activePresetBank = 0
+        var activeExPresetBank = 0
+
+        val lfoTarget = IntArray(4) { 0 }
+        val seqTarget = IntArray(4) { 0 }
+
+        // --- GLOBAL WORKSPACE PERSISTENCE ---
+        fun saveWorkspace(dir: String) {
+            try {
+                val root = JSONObject()
+                val fixArray = JSONArray()
+                fixturesList.forEach { f ->
+                    val fObj = JSONObject()
+                    fObj.put("id", f.id); fObj.put("name", f.name); fObj.put("groupIdx", f.groupIdx)
+                    fObj.put("dmx", f.dmx); fObj.put("channels", f.channels)
+                    val pMap = JSONArray(); f.paramMap.forEach { pMap.put(it) }; fObj.put("paramMap", pMap)
+                    val pMin = JSONArray(); f.paramMin.forEach { pMin.put(it) }; fObj.put("paramMin", pMin)
+                    val pMax = JSONArray(); f.paramMax.forEach { pMax.put(it) }; fObj.put("paramMax", pMax)
+                    fObj.put("cwCount", f.cwCount)
+                    val cwDmx = JSONArray(); f.cwDmx.forEach { cwDmx.put(it) }; fObj.put("cwDmx", cwDmx)
+                    val cwHDmx = JSONArray(); f.cwHalfDmx.forEach { cwHDmx.put(it) }; fObj.put("cwHalfDmx", cwHDmx)
+                    val cwC = JSONArray(); f.cwColors.forEach { cwC.put(it) }; fObj.put("cwColors", cwC)
+                    fixArray.put(fObj)
+                }
+                root.put("fixtures", fixArray)
+
+                val presArray = JSONArray()
+                memoryPresets.forEach { p ->
+                    val pObj = JSONObject()
+                    pObj.put("isSaved", p.isSaved); pObj.put("name", p.name)
+                    val dmxSnap = JSONArray(); p.dmxSnapshot.forEach { dmxSnap.put(it) }; pObj.put("dmxSnapshot", dmxSnap)
+                    pObj.put("colorIdx", p.colorIdx); pObj.put("fadeTime", p.fadeTime); pObj.put("useExMemory", p.useExMemory)
+                    pObj.put("presetTarget", p.presetTarget); pObj.put("useFxMemory", p.useFxMemory)
+                    val exF = JSONArray(); p.exFix.forEach { exF.put(it) }; pObj.put("exFix", exF)
+                    val exD = JSONArray(); p.exDest.forEach { exD.put(it) }; pObj.put("exDest", exD)
+                    val exV = JSONArray(); p.exVal.forEach { exV.put(it) }; pObj.put("exVal", exV)
+                    val eMask = JSONArray(); p.exMask.forEach { eMask.put(it) }; pObj.put("exMask", eMask)
+                    val gMask = JSONArray(); p.groupMask.forEach { gMask.put(it) }; pObj.put("groupMask", gMask)
+                    val lfoEn = JSONArray(); p.lfoEnabledMask.forEach { lfoEn.put(it) }; pObj.put("lfoEnabledMask", lfoEn)
+                    val seqEn = JSONArray(); p.seqEnabledMask.forEach { seqEn.put(it) }; pObj.put("seqEnabledMask", seqEn)
+                    val lfoMat = JSONArray()
+                    for (li in 0..3) { val r = JSONArray(); for (g in 0..7) r.put(p.lfoMatrix[li][g]); lfoMat.put(r) }
+                    pObj.put("lfoMatrix", lfoMat)
+                    val seqMat = JSONArray()
+                    for (li in 0..3) { val r = JSONArray(); for (g in 0..7) r.put(p.seqMatrix[li][g]); seqMat.put(r) }
+                    pObj.put("seqMatrix", seqMat)
+                    // LFO parametry
+                    val lfoSh = JSONArray(); p.lfoShapes.forEach { lfoSh.put(it) }; pObj.put("lfoShapes", lfoSh)
+                    val lfoRt = JSONArray(); p.lfoRates.forEach { lfoRt.put(it.toDouble()) }; pObj.put("lfoRates", lfoRt)
+                    val lfoSy = JSONArray(); p.lfoSyncs.forEach { lfoSy.put(it) }; pObj.put("lfoSyncs", lfoSy)
+                    val lfoSi = JSONArray(); p.lfoSyncIdxs.forEach { lfoSi.put(it) }; pObj.put("lfoSyncIdxs", lfoSi)
+                    val lfoPw = JSONArray(); p.lfoPwms.forEach { lfoPw.put(it) }; pObj.put("lfoPwms", lfoPw)
+                    val mFix=JSONArray(); for(ii in 0..3){val rr=JSONArray(); p.lfoFix[ii].forEach{rr.put(it)}; mFix.put(rr)}; pObj.put("lfoFix",mFix)
+                    val mDst=JSONArray(); for(ii in 0..3){val rr=JSONArray(); p.lfoDest[ii].forEach{rr.put(it)}; mDst.put(rr)}; pObj.put("lfoDest",mDst)
+                    val mAmt=JSONArray(); for(ii in 0..3){val rr=JSONArray(); p.lfoAmt[ii].forEach{rr.put(it)}; mAmt.put(rr)}; pObj.put("lfoAmt",mAmt)
+                    val mFad=JSONArray(); for(ii in 0..3){val rr=JSONArray(); p.lfoFad[ii].forEach{rr.put(it)}; mFad.put(rr)}; pObj.put("lfoFad",mFad)
+                    val mOff=JSONArray(); for(ii in 0..3){val rr=JSONArray(); p.lfoOff[ii].forEach{rr.put(it)}; mOff.put(rr)}; pObj.put("lfoOff",mOff)
+                    val mPhs=JSONArray(); for(ii in 0..3){val rr=JSONArray(); p.lfoPhs[ii].forEach{rr.put(it)}; mPhs.put(rr)}; pObj.put("lfoPhs",mPhs)
+                    // SEQ parametry
+                    val seqTs = JSONArray(); p.seqTotalSteps.forEach { seqTs.put(it) }; pObj.put("seqTotalSteps", seqTs)
+                    val seqGt = JSONArray(); p.seqGlobalTimes.forEach { seqGt.put(it.toDouble()) }; pObj.put("seqGlobalTimes", seqGt)
+                    val seqIs = JSONArray(); p.seqIsSyncs.forEach { seqIs.put(it) }; pObj.put("seqIsSyncs", seqIs)
+                    val seqSi = JSONArray(); p.seqSyncIdxs.forEach { seqSi.put(it) }; pObj.put("seqSyncIdxs", seqSi)
+                    val seqGf = JSONArray(); p.seqGlobalFades.forEach { seqGf.put(it) }; pObj.put("seqGlobalFades", seqGf)
+                    val seqGp = JSONArray(); p.seqGlobalPhases.forEach { seqGp.put(it) }; pObj.put("seqGlobalPhases", seqGp)
+                    val seqStp = JSONArray(); for(ii in 0..3){val r=JSONArray(); p.seqStepTypes[ii].forEach{r.put(it)}; seqStp.put(r)}; pObj.put("seqStepTypes", seqStp)
+                    val seqSv = JSONArray(); for(ii in 0..3){val r=JSONArray(); p.seqStepValues[ii].forEach{r.put(it)}; seqSv.put(r)}; pObj.put("seqStepValues", seqSv)
+                    val seqStm = JSONArray(); for(ii in 0..3){val r=JSONArray(); p.seqStepTimes[ii].forEach{r.put(it.toDouble())}; seqStm.put(r)}; pObj.put("seqStepTimes", seqStm)
+                    val seqSfd = JSONArray(); for(ii in 0..3){val r=JSONArray(); p.seqStepFades[ii].forEach{r.put(it)}; seqSfd.put(r)}; pObj.put("seqStepFades", seqSfd)
+                    val seqSis = JSONArray(); for(ii in 0..3){val r=JSONArray(); p.seqStepIsSyncs[ii].forEach{r.put(it)}; seqSis.put(r)}; pObj.put("seqStepIsSyncs", seqSis)
+                    val seqSsi = JSONArray(); for(ii in 0..3){val r=JSONArray(); p.seqStepSyncIdxs[ii].forEach{r.put(it)}; seqSsi.put(r)}; pObj.put("seqStepSyncIdxs", seqSsi)
+                    pObj.put("extColorPaletteIdx", p.extColorPaletteIdx)
+                    pObj.put("extColorRouting", p.extColorRouting)
+                    pObj.put("useFxMemory", p.useFxMemory)
+                    val fxEn=JSONArray(); p.fxEnabled.forEach{fxEn.put(it)}; pObj.put("fxEnabled",fxEn)
+                    val fxPs=JSONArray(); p.fxPlayState.forEach{fxPs.put(it)}; pObj.put("fxPlayState",fxPs)
+                    val fxSh=JSONArray(); p.fxShapeIdx.forEach{fxSh.put(it)}; pObj.put("fxShapeIdx",fxSh)
+                    val fxSp=JSONArray(); p.fxSpeed.forEach{fxSp.put(it.toDouble())}; pObj.put("fxSpeed",fxSp)
+                    val fxSpr=JSONArray(); p.fxSpread.forEach{fxSpr.put(it)}; pObj.put("fxSpread",fxSpr)
+                    val fxAm=JSONArray(); p.fxAmt.forEach{fxAm.put(it)}; pObj.put("fxAmt",fxAm)
+                    val fxPh=JSONArray(); p.fxPhs.forEach{fxPh.put(it)}; pObj.put("fxPhs",fxPh)
+                    val fxGr=JSONArray(); p.fxGroupIdx.forEach{fxGr.put(it)}; pObj.put("fxGroupIdx",fxGr)
+                    val fxDe=JSONArray(); p.fxDestIdx.forEach{fxDe.put(it)}; pObj.put("fxDestIdx",fxDe)
+                    val fxIs=JSONArray(); p.fxIsSync.forEach{fxIs.put(it)}; pObj.put("fxIsSync",fxIs)
+                    val fxSi=JSONArray(); p.fxSyncIdx.forEach{fxSi.put(it)}; pObj.put("fxSyncIdx",fxSi)
+                    val seqAp=JSONArray(); p.seqActivePatterns.forEach{seqAp.put(it)}; pObj.put("seqActivePatterns",seqAp)
+                    val seqRm=JSONArray(); p.seqRoutingModes.forEach{seqRm.put(it)}; pObj.put("seqRoutingModes",seqRm)
+                    presArray.put(pObj)
+                }
+                root.put("presets", presArray)
+
+                val exPresArray = JSONArray()
+                memoryExPresets.forEach { p ->
+                    val pObj = JSONObject()
+                    pObj.put("isSaved", p.isSaved); pObj.put("name", p.name)
+                    val dmxSnap = JSONArray(); p.dmxSnapshot.forEach { dmxSnap.put(it) }; pObj.put("dmxSnapshot", dmxSnap)
+                    pObj.put("colorIdx", p.colorIdx); pObj.put("fadeTime", p.fadeTime); pObj.put("useExMemory", p.useExMemory)
+                    val exF = JSONArray(); p.exFix.forEach { exF.put(it) }; pObj.put("exFix", exF)
+                    val exD = JSONArray(); p.exDest.forEach { exD.put(it) }; pObj.put("exDest", exD)
+                    val exV = JSONArray(); p.exVal.forEach { exV.put(it) }; pObj.put("exVal", exV)
+                    val exIs = JSONArray(); p.exIsSync.forEach { exIs.put(it) }; pObj.put("exIsSync", exIs)
+                    val exSi = JSONArray(); p.exSyncIdx.forEach { exSi.put(it) }; pObj.put("exSyncIdx", exSi)
+                    exPresArray.put(pObj)
+                }
+                root.put("expresets", exPresArray)
+
+                val posMemArr = JSONArray()
+                for (g in 0..7) {
+                    val grpArr = JSONArray()
+                    for (idx in 0..15) {
+                        val pm = positionMemories[g][idx]
+                        val pmObj = JSONObject()
+                        pmObj.put("isSaved", pm.isSaved)
+                        pmObj.put("name", pm.name)
+                        val snap = JSONArray(); pm.dmxSnapshot.forEach { snap.put(it) }; pmObj.put("dmxSnapshot", snap)
+                        grpArr.put(pmObj)
+                    }
+                    posMemArr.put(grpArr)
+                }
+                root.put("positionMemories", posMemArr)
+
+                val lfoTgt = JSONArray(); lfoTarget.forEach { lfoTgt.put(it) }; root.put("lfoTarget", lfoTgt)
+                val seqTgt = JSONArray(); seqTarget.forEach { seqTgt.put(it) }; root.put("seqTarget", seqTgt)
+                val grpRt = JSONArray(); groupRouting.forEach { grpRt.put(it) }; root.put("groupRouting", grpRt)
+                val pbn=JSONArray(); Companion.presetBankNames.forEach{pbn.put(it)}; root.put("presetBankNames",pbn)
+                val pbc=JSONArray(); Companion.presetBankColors.forEach{pbc.put(it)}; root.put("presetBankColors",pbc)
+                val ebn=JSONArray(); Companion.exBankNames.forEach{ebn.put(it)}; root.put("exBankNames",ebn)
+                val ebc=JSONArray(); Companion.exBankColors.forEach{ebc.put(it)}; root.put("exBankColors",ebc)
+                val midiArr = JSONArray()
+                Companion.midiMappings.forEach { m ->
+                    val o = JSONObject(); o.put("type",m.type); o.put("ch",m.channel); o.put("num",m.number)
+                    o.put("target",m.target); o.put("minVal",m.minVal); o.put("maxVal",m.maxVal); o.put("relSens",m.relSens.toDouble())
+                    midiArr.put(o)
+                }
+                root.put("midiMappings", midiArr)
+
+                // seqRoutingMode
+                val seqModeArr = JSONArray()
+                Companion.seqRoutingMode.forEach { seqModeArr.put(it) }
+                root.put("seqRoutingMode", seqModeArr)
+
+                // seqPatternMemories
+                val patMemArr = JSONArray()
+                for (g in 0..7) {
+                    val grpArr = JSONArray()
+                    for (pi in 0..5) {
+                        val pat = Companion.seqPatternMemories[g][pi]
+                        val pObj = JSONObject()
+                        pObj.put("isSaved", pat.isSaved)
+                        pObj.put("name", pat.name)
+                        val ordArr = JSONArray(); pat.order.forEach { ordArr.put(it) }; pObj.put("order", ordArr)
+                        val onArr = JSONArray(); pat.onList.forEach { onArr.put(it) }; pObj.put("onList", onArr)
+                        grpArr.put(pObj)
+                    }
+                    patMemArr.put(grpArr)
+                }
+                root.put("seqPatternMemories", patMemArr)
+
+                val fxArr = JSONArray()
+                Companion.memoryFx.forEach { fx ->
+                    val o = JSONObject()
+                    o.put("shapeIdx", fx.shapeIdx); o.put("speed", fx.speed.toDouble())
+                    o.put("isSync", fx.isSync); o.put("syncIdx", fx.syncIdx)
+                    o.put("spread", fx.spread); o.put("amt", fx.amt); o.put("phs", fx.phs)
+                    o.put("groupIdx", fx.groupIdx); o.put("destIdx", fx.destIdx)
+                    o.put("playState", fx.playState); o.put("isEnabled", fx.isEnabled)
+                    fxArr.put(o)
+                }
+                root.put("memoryFx", fxArr)
+
+                val perfArr = JSONArray()
+                Companion.perfSettings.forEach { ps ->
+                    val o = JSONObject()
+                    o.put("isToggleMode", ps.isToggleMode); o.put("value", ps.value)
+                    o.put("fadeIn", ps.fadeIn.toDouble()); o.put("fadeOut", ps.fadeOut.toDouble())
+                    val gMask = JSONArray(); ps.groupMask.forEach { gMask.put(it) }; o.put("groupMask", gMask)
+                    perfArr.put(o)
+                }
+                root.put("perfSettings", perfArr)
+
+                File(dir, "workspace.json").writeText(root.toString())
+            } catch (e: Exception) { e.printStackTrace() }
+        }
+
+        fun loadWorkspace(dir: String) {
+            try {
+                val file = File(dir, "workspace.json")
+                if (!file.exists()) return
+                val jsonStr = file.readText()
+                val root = JSONObject(jsonStr)
+
+                if (root.has("fixtures")) {
+                    val fixArray = root.getJSONArray("fixtures")
+                    fixturesList.clear()
+                    for (i in 0 until fixArray.length()) {
+                        val obj = fixArray.getJSONObject(i)
+                        val name = obj.getString("name")
+                        val channels = obj.getInt("channels")
+                        val dmx = obj.getInt("dmx")
+                        val id = obj.getInt("id")
+                        val groupIdx = obj.getInt("groupIdx")
+
+                        val pMapArr = obj.getJSONArray("paramMap")
+                        val paramMap = Array(512) { "" }
+                        for (j in 0 until pMapArr.length()) paramMap[j] = pMapArr.getString(j)
+
+                        val pMinArr = obj.getJSONArray("paramMin")
+                        val paramMin = IntArray(512) { 0 }
+                        for (j in 0 until pMinArr.length()) paramMin[j] = pMinArr.getInt(j)
+
+                        val pMaxArr = obj.getJSONArray("paramMax")
+                        val paramMax = IntArray(512) { 255 }
+                        for (j in 0 until pMaxArr.length()) paramMax[j] = pMaxArr.getInt(j)
+
+                        val cwCount = if (obj.has("cwCount")) obj.getInt("cwCount") else 1
+                        val cwDmx = IntArray(32){0}; if (obj.has("cwDmx")) { val arr = obj.getJSONArray("cwDmx"); for (j in 0 until arr.length()) cwDmx[j] = arr.getInt(j) }
+                        val cwHDmx = IntArray(32){0}; if (obj.has("cwHalfDmx")) { val arr = obj.getJSONArray("cwHalfDmx"); for (j in 0 until arr.length()) cwHDmx[j] = arr.getInt(j) }
+                        val cwC = IntArray(32){0}; if (obj.has("cwColors")) { val arr = obj.getJSONArray("cwColors"); for (j in 0 until arr.length()) cwC[j] = arr.getInt(j) }
+
+                        fixturesList.add(FixtureItem(id, name, groupIdx, dmx, channels, paramMap, paramMin, paramMax, cwCount, cwDmx, cwHDmx, cwC))
+                    }
+                }
+
+                if (root.has("presets")) {
+                    val presArray = root.getJSONArray("presets")
+                    for (i in 0 until presArray.length()) {
+                        if (i >= 64) break
+                        val pObj = presArray.getJSONObject(i)
+                        val p = memoryPresets[i]
+                        p.isSaved = pObj.getBoolean("isSaved")
+                        p.name = pObj.getString("name")
+                        if (pObj.has("colorIdx")) p.colorIdx = pObj.getInt("colorIdx")
+                        if (pObj.has("fadeTime")) p.fadeTime = pObj.getInt("fadeTime")
+                        if (pObj.has("useExMemory")) p.useExMemory = pObj.getBoolean("useExMemory")
+                        if (pObj.has("presetTarget")) p.presetTarget = pObj.getInt("presetTarget")
+                        p.useFxMemory = if (pObj.has("useFxMemory")) pObj.getBoolean("useFxMemory") else true
+
+                        val dmxArr = pObj.getJSONArray("dmxSnapshot")
+                        for (j in 0 until dmxArr.length()) p.dmxSnapshot[j] = dmxArr.getInt(j)
+
+                        if (pObj.has("exFix")) { val arr = pObj.getJSONArray("exFix"); for (j in 0 until arr.length()) p.exFix[j] = arr.getInt(j) }
+                        if (pObj.has("exDest")) { val arr = pObj.getJSONArray("exDest"); for (j in 0 until arr.length()) p.exDest[j] = arr.getInt(j) }
+                        if (pObj.has("exVal")) { val arr = pObj.getJSONArray("exVal"); for (j in 0 until arr.length()) p.exVal[j] = arr.getInt(j) }
+
+                        if (pObj.has("exMask")) { val arr = pObj.getJSONArray("exMask"); for (j in 0 until arr.length()) p.exMask[j] = arr.getBoolean(j) }
+                        if (pObj.has("groupMask")) { val arr = pObj.getJSONArray("groupMask"); for (j in 0 until arr.length()) p.groupMask[j] = arr.getBoolean(j) }
+                        if (pObj.has("lfoEnabledMask")) { val arr = pObj.getJSONArray("lfoEnabledMask"); for (j in 0 until arr.length()) p.lfoEnabledMask[j] = arr.getBoolean(j) }
+                        if (pObj.has("seqEnabledMask")) { val arr = pObj.getJSONArray("seqEnabledMask"); for (j in 0 until arr.length()) p.seqEnabledMask[j] = arr.getBoolean(j) }
+                        if (pObj.has("lfoMatrix")) {
+                            val mat = pObj.getJSONArray("lfoMatrix")
+                            for (li in 0 until minOf(mat.length(), 4)) {
+                                val row = mat.getJSONArray(li)
+                                for (g in 0 until minOf(row.length(), 8)) p.lfoMatrix[li][g] = row.getBoolean(g)
+                            }
+                        }
+                        if (pObj.has("seqMatrix")) {
+                            val mat = pObj.getJSONArray("seqMatrix")
+                            for (li in 0 until minOf(mat.length(), 4)) {
+                                val row = mat.getJSONArray(li)
+                                for (g in 0 until minOf(row.length(), 8)) p.seqMatrix[li][g] = row.getBoolean(g)
+                            }
+                        }
+                        if (pObj.has("lfoShapes")) { val arr = pObj.getJSONArray("lfoShapes"); for (j in 0 until arr.length()) p.lfoShapes[j] = arr.getInt(j) }
+                        if (pObj.has("lfoRates")) { val arr = pObj.getJSONArray("lfoRates"); for (j in 0 until arr.length()) p.lfoRates[j] = arr.getDouble(j).toFloat() }
+                        if (pObj.has("lfoSyncs")) { val arr = pObj.getJSONArray("lfoSyncs"); for (j in 0 until arr.length()) p.lfoSyncs[j] = arr.getBoolean(j) }
+                        if (pObj.has("lfoSyncIdxs")) { val arr = pObj.getJSONArray("lfoSyncIdxs"); for (j in 0 until arr.length()) p.lfoSyncIdxs[j] = arr.getInt(j) }
+                        if (pObj.has("lfoPwms")) { val arr = pObj.getJSONArray("lfoPwms"); for (j in 0 until arr.length()) p.lfoPwms[j] = arr.getInt(j) }
+                        fun loadMatrix4x4Int(key: String, arr: Array<IntArray>) { if (pObj.has(key)) { val mat = pObj.getJSONArray(key); for (i in 0 until mat.length()) { val row = mat.getJSONArray(i); for (j in 0 until row.length()) arr[i][j] = row.getInt(j) } } }
+                        loadMatrix4x4Int("lfoFix", p.lfoFix); loadMatrix4x4Int("lfoDest", p.lfoDest)
+                        loadMatrix4x4Int("lfoAmt", p.lfoAmt); loadMatrix4x4Int("lfoFad", p.lfoFad)
+                        loadMatrix4x4Int("lfoOff", p.lfoOff); loadMatrix4x4Int("lfoPhs", p.lfoPhs)
+                        if (pObj.has("seqTotalSteps")) { val a=pObj.getJSONArray("seqTotalSteps"); for(j in 0 until a.length()) p.seqTotalSteps[j]=a.getInt(j) }
+                        if (pObj.has("seqGlobalTimes")) { val a=pObj.getJSONArray("seqGlobalTimes"); for(j in 0 until a.length()) p.seqGlobalTimes[j]=a.getDouble(j).toFloat() }
+                        if (pObj.has("seqIsSyncs")) { val a=pObj.getJSONArray("seqIsSyncs"); for(j in 0 until a.length()) p.seqIsSyncs[j]=a.getBoolean(j) }
+                        if (pObj.has("seqSyncIdxs")) { val a=pObj.getJSONArray("seqSyncIdxs"); for(j in 0 until a.length()) p.seqSyncIdxs[j]=a.getInt(j) }
+                        if (pObj.has("seqGlobalFades")) { val a=pObj.getJSONArray("seqGlobalFades"); for(j in 0 until a.length()) p.seqGlobalFades[j]=a.getInt(j) }
+                        if (pObj.has("seqGlobalPhases")) { val a=pObj.getJSONArray("seqGlobalPhases"); for(j in 0 until a.length()) p.seqGlobalPhases[j]=a.getInt(j) }
+                        fun loadSeq4x16Int(key: String, arr: Array<IntArray>) { if(pObj.has(key)){val m=pObj.getJSONArray(key); for(i in 0 until m.length()){val r=m.getJSONArray(i); for(j in 0 until r.length()) arr[i][j]=r.getInt(j)}}}
+                        fun loadSeq4x16Float(key: String, arr: Array<FloatArray>) { if(pObj.has(key)){val m=pObj.getJSONArray(key); for(i in 0 until m.length()){val r=m.getJSONArray(i); for(j in 0 until r.length()) arr[i][j]=r.getDouble(j).toFloat()}}}
+                        fun loadSeq4x16Bool(key: String, arr: Array<BooleanArray>) { if(pObj.has(key)){val m=pObj.getJSONArray(key); for(i in 0 until m.length()){val r=m.getJSONArray(i); for(j in 0 until r.length()) arr[i][j]=r.getBoolean(j)}}}
+                        loadSeq4x16Int("seqStepTypes", p.seqStepTypes)
+                        loadSeq4x16Int("seqStepValues", p.seqStepValues)
+                        loadSeq4x16Float("seqStepTimes", p.seqStepTimes)
+                        loadSeq4x16Int("seqStepFades", p.seqStepFades)
+                        loadSeq4x16Bool("seqStepIsSyncs", p.seqStepIsSyncs)
+                        loadSeq4x16Int("seqStepSyncIdxs", p.seqStepSyncIdxs)
+                        if (pObj.has("extColorPaletteIdx")) p.extColorPaletteIdx = pObj.getInt("extColorPaletteIdx")
+                        if (pObj.has("extColorRouting")) p.extColorRouting = pObj.getInt("extColorRouting")
+                        if (pObj.has("useFxMemory")) p.useFxMemory = pObj.getBoolean("useFxMemory")
+                        if (pObj.has("fxEnabled")) { val a=pObj.getJSONArray("fxEnabled"); for(j in 0 until a.length()) p.fxEnabled[j]=a.getBoolean(j) }
+                        if (pObj.has("fxPlayState")) { val a=pObj.getJSONArray("fxPlayState"); for(j in 0 until a.length()) p.fxPlayState[j]=a.getInt(j) }
+                        if (pObj.has("fxShapeIdx")) { val a=pObj.getJSONArray("fxShapeIdx"); for(j in 0 until a.length()) p.fxShapeIdx[j]=a.getInt(j) }
+                        if (pObj.has("fxSpeed")) { val a=pObj.getJSONArray("fxSpeed"); for(j in 0 until a.length()) p.fxSpeed[j]=a.getDouble(j).toFloat() }
+                        if (pObj.has("fxSpread")) { val a=pObj.getJSONArray("fxSpread"); for(j in 0 until a.length()) p.fxSpread[j]=a.getInt(j) }
+                        if (pObj.has("fxAmt")) { val a=pObj.getJSONArray("fxAmt"); for(j in 0 until a.length()) p.fxAmt[j]=a.getInt(j) }
+                        if (pObj.has("fxPhs")) { val a=pObj.getJSONArray("fxPhs"); for(j in 0 until a.length()) p.fxPhs[j]=a.getInt(j) }
+                        if (pObj.has("fxGroupIdx")) { val a=pObj.getJSONArray("fxGroupIdx"); for(j in 0 until a.length()) p.fxGroupIdx[j]=a.getInt(j) }
+                        if (pObj.has("fxDestIdx")) { val a=pObj.getJSONArray("fxDestIdx"); for(j in 0 until a.length()) p.fxDestIdx[j]=a.getInt(j) }
+                        if (pObj.has("fxIsSync")) { val a=pObj.getJSONArray("fxIsSync"); for(j in 0 until a.length()) p.fxIsSync[j]=a.getBoolean(j) }
+                        if (pObj.has("fxSyncIdx")) { val a=pObj.getJSONArray("fxSyncIdx"); for(j in 0 until a.length()) p.fxSyncIdx[j]=a.getInt(j) }
+                        if (pObj.has("seqActivePatterns")) { val a=pObj.getJSONArray("seqActivePatterns"); for(j in 0 until a.length()) p.seqActivePatterns[j]=a.getInt(j) }
+                        if (pObj.has("seqRoutingModes")) { val a=pObj.getJSONArray("seqRoutingModes"); for(j in 0 until a.length()) p.seqRoutingModes[j]=a.getInt(j) }
+                    }
+                }
+
+                if (root.has("expresets")) {
+                    val exArray = root.getJSONArray("expresets")
+                    for (i in 0 until exArray.length()) {
+                        if (i >= 64) break
+                        val pObj = exArray.getJSONObject(i)
+                        val p = memoryExPresets[i]
+                        p.isSaved = pObj.getBoolean("isSaved")
+                        p.name = pObj.getString("name")
+                        if (pObj.has("colorIdx")) p.colorIdx = pObj.getInt("colorIdx")
+                        if (pObj.has("fadeTime")) p.fadeTime = pObj.getInt("fadeTime")
+                        if (pObj.has("useExMemory")) p.useExMemory = pObj.getBoolean("useExMemory")
+
+                        val dmxArr = pObj.getJSONArray("dmxSnapshot")
+                        for (j in 0 until dmxArr.length()) p.dmxSnapshot[j] = dmxArr.getInt(j)
+
+                        if (pObj.has("exFix")) { val arr = pObj.getJSONArray("exFix"); for (j in 0 until arr.length()) p.exFix[j] = arr.getInt(j) }
+                        if (pObj.has("exDest")) { val arr = pObj.getJSONArray("exDest"); for (j in 0 until arr.length()) p.exDest[j] = arr.getInt(j) }
+                        if (pObj.has("exVal")) { val arr = pObj.getJSONArray("exVal"); for (j in 0 until arr.length()) p.exVal[j] = arr.getInt(j) }
+                        if (pObj.has("exIsSync")) { val arr = pObj.getJSONArray("exIsSync"); for (j in 0 until arr.length()) p.exIsSync[j] = arr.getBoolean(j) }
+                        if (pObj.has("exSyncIdx")) { val arr = pObj.getJSONArray("exSyncIdx"); for (j in 0 until arr.length()) p.exSyncIdx[j] = arr.getInt(j) }
+                    }
+                }
+
+                if (root.has("positionMemories")) {
+                    val posMemArr = root.getJSONArray("positionMemories")
+                    for (g in 0 until minOf(posMemArr.length(), 8)) {
+                        val grpArr = posMemArr.getJSONArray(g)
+                        for (idx in 0 until minOf(grpArr.length(), 16)) {
+                            val pmObj = grpArr.getJSONObject(idx)
+                            val pm = positionMemories[g][idx]
+                            pm.isSaved = pmObj.getBoolean("isSaved")
+                            pm.name = pmObj.getString("name")
+                            val snap = pmObj.getJSONArray("dmxSnapshot")
+                            for (j in 0 until snap.length()) pm.dmxSnapshot[j] = snap.getInt(j)
+                        }
+                    }
+                }
+
+                if (root.has("lfoTarget")) { val a = root.getJSONArray("lfoTarget"); for (i in 0 until a.length()) lfoTarget[i] = a.getInt(i) }
+                if (root.has("seqTarget")) { val a = root.getJSONArray("seqTarget"); for (i in 0 until a.length()) seqTarget[i] = a.getInt(i) }
+                if (root.has("groupRouting")) { val a = root.getJSONArray("groupRouting"); for (i in 0 until a.length()) groupRouting[i] = a.getInt(i) }
+                if (root.has("presetBankNames")) { val a=root.getJSONArray("presetBankNames"); for(i in 0 until a.length()) Companion.presetBankNames[i]=a.getString(i) }
+                if (root.has("presetBankColors")) { val a=root.getJSONArray("presetBankColors"); for(i in 0 until a.length()) Companion.presetBankColors[i]=a.getInt(i) }
+                if (root.has("exBankNames")) { val a=root.getJSONArray("exBankNames"); for(i in 0 until a.length()) Companion.exBankNames[i]=a.getString(i) }
+                if (root.has("exBankColors")) { val a=root.getJSONArray("exBankColors"); for(i in 0 until a.length()) Companion.exBankColors[i]=a.getInt(i) }
+                if (root.has("midiMappings")) {
+                    val arr = root.getJSONArray("midiMappings")
+                    midiMappings.clear()
+                    for (i in 0 until arr.length()) {
+                        val o = arr.getJSONObject(i)
+                        midiMappings.add(MidiMapping(o.getInt("type"),o.getInt("ch"),o.getInt("num"),o.getString("target"),o.optInt("minVal",0),o.optInt("maxVal",127),o.optDouble("relSens",1.0).toFloat()))
+                    }
+                }
+
+                if (root.has("memoryFx")) {
+                    val arr = root.getJSONArray("memoryFx")
+                    for (i in 0 until minOf(arr.length(), 4)) {
+                        val o = arr.getJSONObject(i)
+                        val fx = memoryFx[i]
+                        fx.shapeIdx = o.optInt("shapeIdx", 0)
+                        fx.speed = o.optDouble("speed", 0.5).toFloat()
+                        fx.spread = o.optInt("spread", 4)
+                        fx.amt = o.optInt("amt", 100)
+                        fx.phs = o.optInt("phs", 0)
+                        fx.groupIdx = o.optInt("groupIdx", 0)
+                        fx.destIdx = o.optInt("destIdx", -1)
+                        fx.playState = o.optInt("playState", 0)
+                        fx.isEnabled = o.optBoolean("isEnabled", false)
+                        fx.isSync    = o.optBoolean("isSync", false)
+                        fx.syncIdx   = o.optInt("syncIdx", 6)
+                        fxBaseSpeeds[i] = fx.speed
+                        fxBaseAmts[i] = fx.amt
+                        fxBasePhss[i] = fx.phs
+                    }
+                }
+
+                if (root.has("seqRoutingMode")) {
+                    val a = root.getJSONArray("seqRoutingMode")
+                    for (i in 0 until minOf(a.length(), 8)) Companion.seqRoutingMode[i] = a.getInt(i)
+                }
+
+                if (root.has("seqPatternMemories")) {
+                    val patMemArr = root.getJSONArray("seqPatternMemories")
+                    for (g in 0 until minOf(patMemArr.length(), 8)) {
+                        val grpArr = patMemArr.getJSONArray(g)
+                        for (pi in 0 until minOf(grpArr.length(), 6)) {
+                            val pObj = grpArr.getJSONObject(pi)
+                            val pat = Companion.seqPatternMemories[g][pi]
+                            pat.isSaved = pObj.getBoolean("isSaved")
+                            pat.name = pObj.getString("name")
+                            pat.order.clear()
+                            val ordArr = pObj.getJSONArray("order")
+                            for (i in 0 until ordArr.length()) pat.order.add(ordArr.getInt(i))
+                            pat.onList.clear()
+                            val onArr = pObj.getJSONArray("onList")
+                            for (i in 0 until onArr.length()) pat.onList.add(onArr.getBoolean(i))
+                        }
+                    }
+                }
+
+                if (root.has("perfSettings")) {
+                    val arr = root.getJSONArray("perfSettings")
+                    for (i in 0 until minOf(arr.length(), 8)) {
+                        val o = arr.getJSONObject(i)
+                        val ps = perfSettings[i]
+                        ps.isToggleMode = o.optBoolean("isToggleMode", false)
+                        ps.value = o.optInt("value", 255)
+                        ps.fadeIn = o.optDouble("fadeIn", 0.0).toFloat()
+                        ps.fadeOut = o.optDouble("fadeOut", 0.0).toFloat()
+                        if (o.has("groupMask")) {
+                            val gArr = o.getJSONArray("groupMask")
+                            for (j in 0 until minOf(gArr.length(), 8)) ps.groupMask[j] = gArr.getBoolean(j)
+                        }
+                    }
+                }
+            } catch (e: Exception) { e.printStackTrace() }
+        }
+    }
+
+    private val leftButtons = mutableListOf<TextView>()
+    private val tabButtons = mutableListOf<TextView>()
+
+    private lateinit var activeViewContainer: FrameLayout
+    private lateinit var fixturesContainer: LinearLayout
+
+    private lateinit var keyboardOverlay: LinearLayout
+    private lateinit var numpadOverlay: LinearLayout
+    private lateinit var paramMenuOverlay: FrameLayout
+    private lateinit var loadMenuOverlay: FrameLayout
+    private lateinit var loadMenuListLayout: LinearLayout
+    private lateinit var paletteMenuOverlay: FrameLayout
+    private lateinit var keyboardDisplay: TextView
+    private lateinit var numpadDisplay: TextView
+
+    private val sliderContainers = mutableListOf<FrameLayout>()
+    private val sliderSeekBars = mutableListOf<SeekBar>()
+    private val sliderLabels = mutableListOf<TextView>()
+    private lateinit var groupNameText: TextView
+    private lateinit var groupChText: TextView
+    private lateinit var fixBtn: TextView
+    private lateinit var pagePrevBtn: TextView
+    private lateinit var pageNextBtn: TextView
+    private lateinit var fixPrevBtn: TextView
+    private lateinit var fixNextBtn: TextView
+
+    private var exactRowHeight: Int = 100
+
+    private var extColorSelected = false
+
+
+    private var stopSeqActive = false
+
+    private val stopLfoSavedEnabled = BooleanArray(4) { false }
+
+    private val stopSeqEnabled = BooleanArray(4) { false }
+    private val stopLfoEnabled = BooleanArray(4) { false }
+
+    private val fanDmxOffsets = IntArray(512) { 0 }
+
+    private var posCurrentGroup = 0
+    private var posIsFixtureMode = false
+    private var posCurrentFixture = 1
+    private var posSelectedParam = 0
+    private var posIsCopyMode = false
+    private var posClearMode = false
+    private var posCopySourceIndex = -1
+    private var posEditMode = false
+    private var posClearPendingIndex = -1
+    private var posPanInverted = false
+    private var posTiltInverted = false
+    private var touchpadRef: FrameLayout? = null
+    private var crossHRef: View? = null
+    private var crossVRef: View? = null
+    private var crossDotRef: View? = null
+    private var panTiltLabelRef: TextView? = null
+    private var seqPosLabelRef: TextView? = null
+    private var pfTfLabelRef: TextView? = null
+    private var rightSliderRef: SeekBar? = null
+    private var numpadSliderRef: SeekBar? = null
+    private val posActiveMemory = IntArray(8) { -1 }
+    private val posFanValues = IntArray(8) { 128 }  // 128 = brak rozsiewu
+    private var sensorManager: android.hardware.SensorManager? = null
+    private var rotationSensor: android.hardware.Sensor? = null
+    private var gyroBaseAzimuth = 0f
+    private var gyroBasePitch   = 0f
+    private var gyroBasePan     = 128
+    private var gyroBaseTilt    = 128
+    private var gyroXAxis = 0; private var gyroYAxis = 1  // 0=Pan, 1=Tilt
+    private var gyroXOffset = 0; private var gyroYOffset = 0
+    private var gyroXRange = 100; private var gyroYRange = 100
+    private var gyroSettingsSlot = 0
+    private var gyroXInverted = false
+    private var gyroYInverted = false
+    private lateinit var gyroSettingsOverlay: FrameLayout
+    private var midiManager: android.media.midi.MidiManager? = null
+    private lateinit var midiRootFrame: FrameLayout
+    private var midiLearnOverlay: FrameLayout? = null
+    private var midiLearnStatusTv: TextView? = null
+
+    private var positionsRefreshCallback: (() -> Unit)? = null
+    private val midiPosHoldTimers = HashMap<String, Long>()
+
+    private var midiGlobalScrollY = 0
+    private var midiGlobalScrollView: ScrollView? = null
+    private lateinit var dmxWakeLock: android.os.PowerManager.WakeLock
+
+
+    private var presetsRefreshCallback: (() -> Unit)? = null
+
+    private var exPresetsRefreshCallback: (() -> Unit)? = null
+
+    private val fxLiveTvs = HashMap<Int, TextView>()
+
+    private var wifiNetworkCallback: android.net.ConnectivityManager.NetworkCallback? = null
+
+    private val gyroListener = object : android.hardware.SensorEventListener {
+        override fun onSensorChanged(event: android.hardware.SensorEvent) {
+            if (!Companion.gyroEnabled) return
+            val rot = FloatArray(9)
+            android.hardware.SensorManager.getRotationMatrixFromVector(rot, event.values)
+            val orient = FloatArray(3)
+            android.hardware.SensorManager.getOrientation(rot, orient)
+            val azimuth = Math.toDegrees(orient[0].toDouble()).toFloat()  // pan
+            val pitch   = Math.toDegrees(orient[1].toDouble()).toFloat()  // tilt
+
+            val dAz = ((azimuth - gyroBaseAzimuth + 540) % 360 - 180)
+            val dPi = ((pitch   - gyroBasePitch   + 540) % 360 - 180)
+
+            val panSens  = 1.5f * gyroXRange / 100f
+            val tiltSens = 1.5f * gyroYRange / 100f
+            val rawPan  = (gyroBasePan  + dAz * panSens  + gyroXOffset).toInt().coerceIn(0, 255)
+            val rawTilt = (gyroBaseTilt + dPi * tiltSens + gyroYOffset).toInt().coerceIn(0, 255)
+            val panRaw  = if (gyroXAxis == 0) rawPan  else rawTilt
+            val tiltRaw = if (gyroYAxis == 1) rawTilt else rawPan
+            val newPan  = if (gyroXInverted) 255 - panRaw  else panRaw
+            val newTilt = if (gyroYInverted) 255 - tiltRaw else tiltRaw
+
+            val fixes = fixturesList.filter { it.groupIdx == posCurrentGroup }
+            val targets = if (posIsFixtureMode) listOfNotNull(fixes.getOrNull(posCurrentFixture - 1)) else fixes
+            targets.forEach { fix ->
+                for (ch in 0 until fix.channels) {
+                    when (fix.paramMap[ch]) {
+                        "Pan"  -> { val a = fix.dmx-1+ch; if (a in 0..511) { val m = fix.paramMin[ch] + (newPan  * (fix.paramMax[ch]-fix.paramMin[ch])/255); Companion.overrideChannel(a,m); setDmxChannel(a,m) } }
+                        "Tilt" -> { val a = fix.dmx-1+ch; if (a in 0..511) { val m = fix.paramMin[ch] + (newTilt * (fix.paramMax[ch]-fix.paramMin[ch])/255); Companion.overrideChannel(a,m); setDmxChannel(a,m) } }
+                    }
+                }
+            }
+        }
+        override fun onAccuracyChanged(s: android.hardware.Sensor?, a: Int) {}
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        supportActionBar?.hide()
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        window.addFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED)
+        window.addFlags(WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON)
+        window.setFlags(
+            WindowManager.LayoutParams.FLAG_FULLSCREEN,
+            WindowManager.LayoutParams.FLAG_FULLSCREEN
+        )
+        window.decorView.systemUiVisibility =
+            (View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_FULLSCREEN)
+
+        startEngine(applicationContext.filesDir.absolutePath)
+        loadWorkspace(applicationContext.filesDir.absolutePath)
+        loadProfilesFromDisk(applicationContext.filesDir.absolutePath)
+
+        // ── Fade startowy 3s – TYLKO przy pierwszym uruchomieniu procesu ──
+        if (!Companion.firstLaunchDone) {
+            Companion.firstLaunchDone = true
+            Companion.updateFadeMask()
+            val movementParams =
+                setOf("Pan", "Pan Fine", "Tilt", "Tilt Fine", "Zoom", "Focus", "Iris")
+            Companion.fixturesList.forEach { fix ->
+                for (ch in 0 until fix.channels) {
+                    if (fix.paramMap[ch] in movementParams) {
+                        val addr = fix.dmx - 1 + ch
+                        if (addr in 0..511) {
+                            Companion.baseDmxStartMain[addr] = 0
+                            Companion.baseDmxStartAux[addr] = 0
+                            setDmxChannel(addr, 0)
+                        }
+                    }
+                }
+            }
+            Companion.currentFadeTimeMain = 3.0f
+            Companion.currentFadeTimerMain = 0.0f
+            Companion.isFadingMain = true
+            Companion.currentFadeTimeAux = 3.0f
+            Companion.currentFadeTimerAux = 0.0f
+            Companion.isFadingAux = true
+        }
+
+        exactRowHeight = (resources.displayMetrics.heightPixels / 9.0).toInt()
+
+        corePaletteColors[0] = Color.rgb(220, 220, 230)
+        for (i in 1..30) {
+            val hue = ((i - 1) / 30.0f) * 360f
+            corePaletteColors[i] = Color.HSVToColor(floatArrayOf(hue, 1.0f, 1.0f))
+        }
+        corePaletteColors[31] = Color.WHITE
+        for (i in 32..47) {
+            val hue = ((i - 32) / 15.0f) * 360f
+            corePaletteColors[i] = Color.HSVToColor(floatArrayOf(hue, 0.6f, 1.0f))
+        }
+        for (i in 48..63) {
+            val col = i - 48
+            val ratio = col / 15.0f
+            val r = (255 + (200 - 255) * ratio).toInt()
+            val g = (160 + (220 - 160) * ratio).toInt()
+            val b = (80 + (255 - 80) * ratio).toInt()
+            val w = (255 * (1.0f - Math.abs(col - 7.5f) / 7.5f)).toInt().coerceIn(0, 255)
+            val blend = w / 255.0f
+            corePaletteColors[i] = Color.rgb(
+                (r + (255 - r) * blend).toInt().coerceIn(0, 255),
+                (g + (255 - g) * blend).toInt().coerceIn(0, 255),
+                (b + (255 - b) * blend).toInt().coerceIn(0, 255)
+            )
+        }
+
+        val mainContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            weightSum = 8.0f
+            setBackgroundColor(Color.BLACK)
+        }
+
+        val contentArea = FrameLayout(this).apply {
+            layoutParams =
+                LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 8.0f)
+            setBackgroundColor(Color.LTGRAY)
+        }
+
+        activeViewContainer = FrameLayout(this).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        }
+        contentArea.addView(activeViewContainer)
+
+        val tabRadius = exactRowHeight * 0.28f
+
+        fun makeTopTabBg(active: Boolean, index: Int, total: Int): GradientDrawable {
+            return GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                setColor(if (active) Color.LTGRAY else Color.DKGRAY)
+                if (active) {
+                    val r = tabRadius
+                    // [TL, TL, TR, TR, BR, BR, BL, BL]
+                    // [TL, TL, TR, TR, BR, BR, BL, BL]
+                    setCornerRadii(when {
+                        index == 0         -> floatArrayOf(r,r, 0f,0f, 0f,0f, 0f,0f)  // tylko TL
+                        index == total - 1 -> floatArrayOf(0f,0f, r,r, 0f,0f, 0f,0f)  // tylko TR
+                        else               -> floatArrayOf(r,r, r,r, 0f,0f, 0f,0f)    // TL + TR
+                    })
+                }
+            }
+        }
+
+
+
+        val emptyView = FrameLayout(this)
+
+        val leftBar = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            weightSum = 9.0f
+            layoutParams =
+                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1.0f)
+            setBackgroundColor(Color.DKGRAY)
+            addView(FrameLayout(this@MainActivity).apply {
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, 0, 1.0f)
+                setBackgroundColor(Color.BLACK)
+                addView(TextView(this@MainActivity).apply {
+                    text = "MIDI\nLEARN"
+                    gravity = Gravity.CENTER; textSize = 11f
+                    setTextColor(Color.WHITE)
+                    layoutParams = FrameLayout.LayoutParams(-1, -1)
+                    setOnClickListener { showMidiLearnTypeMenu() }
+                    // Podświetlenie gdy aktywny
+                    background = GradientDrawable().apply {
+                        shape = GradientDrawable.RECTANGLE; cornerRadius = 6f
+                        setColor(Color.parseColor("#330000FF"))
+                    }
+                }.also { btn ->
+                    // Odświeżaj kolor live
+                    lifecycleScope.launchWhenResumed {
+                        while (isActive) {
+                            delay(200)
+                            runOnUiThread {
+                                (btn.background as? GradientDrawable)?.setColor(
+                                    when {
+                                        Companion.midiLearnUISelect -> Color.parseColor("#FF8800")
+                                        Companion.midiLearnActive   -> Color.parseColor("#AA0055FF")
+                                        else                        -> Color.parseColor("#330000FF")
+                                    }
+                                )
+                            }
+                        }
+                    }
+                })
+            })
+
+            val btnNames = listOf(
+                "Settings",
+                "Fixtures",
+                "MIDI",
+                "FX",
+                "Sequence",
+                "Gobos",
+                "Ex-preset",
+                "Preset"
+            )
+
+            btnNames.forEachIndexed { i, name ->
+
+
+                val btn = TextView(this@MainActivity).apply {
+                    text = name; gravity = Gravity.CENTER; textSize = 14f
+                    setTextColor(Color.WHITE)
+                    tag = "MIDI:VIEW_$name"
+                    layoutParams =
+                        LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1.0f)
+                    setOnClickListener {
+                        setActiveTab(this, true); activeViewContainer.removeAllViews()
+                        when (name) {
+                            "Fixtures"  -> activeViewContainer.addView(createFixturesView())
+                            "Positions" -> activeViewContainer.addView(createPositionsView())
+                            "Preset"    -> activeViewContainer.addView(createPresetsView(false))
+                            "Ex-preset" -> activeViewContainer.addView(createPresetsView(true))
+                            "FX"        -> activeViewContainer.addView(createFxView())
+                            "Sequence"  -> activeViewContainer.addView(createSequenceView())
+                            "MIDI"      -> activeViewContainer.addView(createMidiView())
+                            "Settings"  -> activeViewContainer.addView(createSettingsView())
+                            else        -> activeViewContainer.addView(emptyView)
+                        }
+                    }
+                }
+                leftButtons.add(btn); addView(btn)
+            }
+        }
+
+        val centerLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; weightSum = 9.0f
+            layoutParams =
+                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 6.0f)
+        }
+
+        val tabContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; weightSum = 6.0f
+            layoutParams =
+                LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1.0f)
+            setBackgroundColor(Color.DKGRAY)
+        }
+
+        val tabNames = listOf("Matrix", "Colors", "Positions", "Sliders", "Macros", "Perform")
+        tabNames.forEachIndexed { index, name ->
+            val tabIdx = index
+            val tabCount = tabNames.size
+            val btn = TextView(this@MainActivity).apply {
+                text = name; gravity = Gravity.CENTER; textSize = 14f
+                setTextColor(Color.WHITE)
+                tag = "MIDI:VIEW_$name"
+                layoutParams =
+                    LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1.0f)
+                setOnClickListener {
+                    setActiveTab(this, false); activeViewContainer.removeAllViews()
+                    when (name) {
+                        "Matrix" -> activeViewContainer.addView(createMatrixView())
+                        "Sliders" -> activeViewContainer.addView(createSlidersView())
+                        "Colors" -> activeViewContainer.addView(createColorView())
+                        "Positions" -> activeViewContainer.addView(createPositionsView())
+                        "Perform" -> activeViewContainer.addView(createPerformView())
+                        else -> activeViewContainer.addView(emptyView)
+                    }
+                }
+            }
+            btn.background = makeTopTabBg(false, tabIdx, tabCount)
+            tabButtons.add(btn); tabContainer.addView(btn)
+        }
+
+        setActiveTab(tabButtons[1], false)
+        centerLayout.addView(tabContainer); centerLayout.addView(contentArea)
+
+        val perfPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; weightSum = 9.0f
+            layoutParams =
+                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1.0f)
+                    .apply { setMargins(5, 0, 0, 0) }
+            addView(FrameLayout(this@MainActivity).apply {
+                layoutParams =
+                    LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1.0f)
+                setBackgroundColor(Color.parseColor("#222222"))
+                tag = "TAP_TEMPO_SLOT"
+            })
+
+            val perfNames = listOf(
+                "Blinder",
+                "Strobe",
+                "Color",
+                "Fast",
+                "Slow",
+                "STOP",
+                "Blackout",
+                "Smoke"
+            )
+            perfNames.forEachIndexed { i, name ->
+                addView(Button(this@MainActivity).apply {
+                    text = name
+                    tag = "MIDI:PERF_$i"
+                    backgroundTintList =
+                        ColorStateList.valueOf(if (name == "STOP SEQ") Color.parseColor("#883300") else Color.DKGRAY)
+                    layoutParams =
+                        LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1.0f)
+                    setOnClickListener {
+                        if (name == "STOP SEQ") {
+                            if (!stopSeqActive) {
+                                stopSeqActive = true
+                                for (si in 0..3) {
+                                    stopSeqEnabled[si] = seqEnabled[si]; seqEnabled[si] = false
+                                }
+                                for (li in 0..3) {
+                                    stopLfoEnabled[li] = lfoEnabled[li]; lfoEnabled[li] = false
+                                }
+                            } else {
+                                stopSeqActive = false
+                                for (si in 0..3) seqEnabled[si] = stopSeqEnabled[si]
+                                for (li in 0..3) lfoEnabled[li] = stopLfoEnabled[li]
+                            }
+                        } else pressButton(4 + i)
+                    }
+                })
+            }
+        }
+
+        mainContainer.addView(leftBar); mainContainer.addView(centerLayout); mainContainer.addView(
+            perfPanel
+        )
+        midiRootFrame = FrameLayout(this).apply { addView(mainContainer) }
+
+        keyboardOverlay = createInternalKeyboard()
+        numpadOverlay = createInternalNumpad()
+        gyroSettingsOverlay = buildGyroSettingsOverlay()
+        paramMenuOverlay = createInternalParamMenu()
+        loadMenuOverlay = createInternalLoadMenu()
+        paletteMenuOverlay = createInternalPaletteMenu()
+        contentArea.addView(keyboardOverlay); contentArea.addView(numpadOverlay); contentArea.addView(
+            paramMenuOverlay
+        ); contentArea.addView(loadMenuOverlay); contentArea.addView(paletteMenuOverlay); contentArea.addView(
+            gyroSettingsOverlay
+        )
+
+        setContentView(midiRootFrame)
+        setupPerfButtonsGlobal()
+
+        val tapTempoSlot = mainContainer.findViewWithTag<FrameLayout>("TAP_TEMPO_SLOT")
+        val tapTempoContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = FrameLayout.LayoutParams(-1, -1).apply { setMargins(4,2,4,2) }
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE; cornerRadius = 6f
+                setColor(Color.parseColor("#333333")); setStroke(2, Color.parseColor("#666666"))
+            }
+        }
+        val tapTempoBtn = TextView(this).apply {
+            text = "TAP"; gravity = Gravity.CENTER; textSize = 13f
+            setTextColor(Color.WHITE); typeface = android.graphics.Typeface.DEFAULT_BOLD
+            layoutParams = LinearLayout.LayoutParams(-1, 0, 1f)
+        }
+        val bpmLabel = TextView(this).apply {
+            text = "120 BPM"; gravity = Gravity.CENTER; textSize = 11f
+            setTextColor(Color.parseColor("#00FFAA"))
+            layoutParams = LinearLayout.LayoutParams(-1, 0, 1f)
+        }
+        tapTempoContainer.addView(tapTempoBtn)
+        tapTempoContainer.addView(bpmLabel)
+        tapTempoContainer.setOnClickListener {
+            handleTapTempo()
+            (tapTempoContainer.background as? GradientDrawable)?.setColor(Color.parseColor("#005533"))
+            tapTempoContainer.postDelayed({
+                (tapTempoContainer.background as? GradientDrawable)?.setColor(Color.parseColor("#222222"))
+            }, 80)
+        }
+        tapTempoContainer.setOnLongClickListener {
+            resyncAllSynced(); true
+        }
+        tapTempoSlot?.addView(tapTempoContainer)
+
+        lifecycleScope.launchWhenResumed {
+            while (isActive) {
+                delay(200)
+                bpmLabel.text = "${Companion.masterBpm.toInt()} BPM"
+            }
+        }
+
+        // Bind do WiFi – ArtNet działa niezależnie od danych mobilnych
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+        val wifiRequest = android.net.NetworkRequest.Builder()
+            .addTransportType(android.net.NetworkCapabilities.TRANSPORT_WIFI)
+            .build()
+        wifiNetworkCallback = object : android.net.ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: android.net.Network) {
+                cm.bindProcessToNetwork(network)
+            }
+            override fun onLost(network: android.net.Network) {
+                cm.bindProcessToNetwork(null)
+            }
+        }
+        cm.registerNetworkCallback(wifiRequest, wifiNetworkCallback!!)
+
+        dmxWakeLock = (getSystemService(Context.POWER_SERVICE) as android.os.PowerManager)
+            .newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "DMX:MidiWakeLock")
+        dmxWakeLock.acquire()
+
+        // Overlay MIDI Learn
+        val mlOverlay = FrameLayout(this).apply {
+            layoutParams = FrameLayout.LayoutParams(-1, -1)
+            setBackgroundColor(Color.parseColor("#CC000000"))
+            visibility = View.GONE
+        }
+        val mlStatusTv = TextView(this).apply {
+            gravity = Gravity.CENTER; textSize = 22f; setTextColor(Color.WHITE)
+            setPadding(40, 40, 40, 40)
+            layoutParams = FrameLayout.LayoutParams(-1, -1)
+        }
+        mlOverlay.addView(mlStatusTv)
+        mlOverlay.setOnClickListener { hideMidiLearnOverlay() }
+        midiRootFrame.addView(mlOverlay)
+        midiLearnOverlay = mlOverlay
+        midiLearnStatusTv = mlStatusTv
+        midiLearnOverlay?.addView(TextView(this).apply {
+            text = "CLEAR"; gravity = Gravity.CENTER; textSize = 16f; setTextColor(Color.WHITE)
+            background = getBtnStyle().apply { setColor(Color.parseColor("#880000")) }
+            layoutParams = FrameLayout.LayoutParams((exactRowHeight*3), exactRowHeight, Gravity.CENTER_HORIZONTAL or Gravity.BOTTOM).apply { bottomMargin = exactRowHeight * 1 }
+            setOnClickListener {
+                val targetToClear = Companion.midiLearnTarget
+                if (targetToClear.isNotEmpty()) {
+                    val removed = Companion.midiMappings.removeAll { it.target == targetToClear }
+                    if (removed) Companion.saveWorkspace(applicationContext.filesDir.absolutePath)
+                }
+                hideMidiLearnOverlay()
+                runOnUiThread { midiMenuRebuildCallback?.invoke() }
+            }
+        })
+
+
+        if (android.os.Build.VERSION.SDK_INT >= 23) {
+            midiManager = getSystemService(android.content.Context.MIDI_SERVICE)
+                    as? android.media.midi.MidiManager
+            setupMidi()
+        }
+        sensorManager = getSystemService(SENSOR_SERVICE) as android.hardware.SensorManager
+        rotationSensor =
+            sensorManager?.getDefaultSensor(android.hardware.Sensor.TYPE_ROTATION_VECTOR)
+                ?: sensorManager?.getDefaultSensor(android.hardware.Sensor.TYPE_GAME_ROTATION_VECTOR)
+                        ?: sensorManager?.getDefaultSensor(android.hardware.Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR)
+        sensorManager?.registerListener(
+            gyroListener,
+            rotationSensor,
+            android.hardware.SensorManager.SENSOR_DELAY_GAME
+        )
+
+
+
+        if (!Companion.engineRunning) {
+            Companion.engineRunning = true
+            Companion.dmxScope.launch {
+                var lastTickNanos = System.nanoTime()
+                while (isActive) {
+                    val nowNanos = System.nanoTime()
+                    val dt = ((nowNanos - lastTickNanos) / 1_000_000_000.0).coerceIn(0.001, 0.1)
+                    lastTickNanos = nowNanos
+                    tickEngine(dt)
+
+                    // ── SILNIK LFO ──────────────────────────────────────
+                    val syncBeats = listOf(
+                        99999f,
+                        0.0625f,
+                        0.125f,
+                        0.25f,
+                        0.5f,
+                        4f / 6f,
+                        1f,
+                        4f / 3f,
+                        2f,
+                        4f,
+                        8f,
+                        12f,
+                        16f
+                    )
+                    val masterBpm = Companion.masterBpm
+                    val baseBeatIncrement = dt * (masterBpm / 60.0)  // 1 "beat" = 60/masterBpm sekund
+
+                    // Przelicz per-grupowy mnożnik tempa na podstawie FAST/SLOW/STOP
+                    for (g in 0..7) Companion.perfGroupTempoMult[g] = 1f
+                    if (Companion.perfSettings[3].isActive) {
+                        val mult = Companion.perfTempoMultiplier
+                        for (g in 0..7) if (Companion.perfSettings[3].groupMask[g]) Companion.perfGroupTempoMult[g] = mult
+                    }
+                    if (Companion.perfSettings[4].isActive) {
+                        val mult = Companion.perfTempoMultiplier
+                        for (g in 0..7) if (Companion.perfSettings[4].groupMask[g]) Companion.perfGroupTempoMult[g] = mult
+                    }
+                    if (Companion.perfSettings[5].isActive) {
+                        for (g in 0..7) if (Companion.perfSettings[5].groupMask[g]) Companion.perfGroupTempoMult[g] = 0f
+                    }
+
+                    refreshDmxOutput()  // zawsze odśwież presetDmxValues PRZED LFO
+                    System.arraycopy(Companion.presetDmxValues, 0, Companion.lfoOutputValues, 0, 512)
+
+                    val lfoFadeParams = setOf("Pan","Tilt","Zoom","Red","Green","Blue","White","Amber","UV","Beam 1R","Beam 1G","Beam 1B","Beam 1W","Beam 1A","Dimmer")
+                    val lfoAccum = FloatArray(512) { 0f }
+                    val lfoTouched = BooleanArray(512) { false }
+
+                    for (li in 0..3) {
+                        if (!lfoEnabled[li]) {
+                            // Zwolnij wszystkie kanały tego LFO
+                            val lfo = memoryLfo[li]
+                            for (d in 0..3) {
+                                val fId0 = lfo.fix[d];
+                                val dIdx0 = lfo.dest[d]
+                                if (fId0 == -1 || dIdx0 == -1) continue
+                                val pName0 = Companion.paramList.getOrNull(dIdx0) ?: continue
+                                val fixes0 = if (fId0 in 1000..1007)
+                                    Companion.fixturesList.filter { it.groupIdx == fId0 - 1000 }
+                                else listOfNotNull(Companion.fixturesList.find { it.id == fId0 })
+                                fixes0.forEach { fix ->
+                                    for (ch in 0 until fix.channels) {
+                                        if (fix.paramMap[ch] == pName0) {
+                                            val actCh = fix.dmx - 1 + ch
+                                            if (actCh in 0..511) Companion.effectManagedChannels[actCh] =
+                                                false
+                                        }
+                                    }
+                                }
+                            }
+                            continue
+                        }
+
+                        val lfo = memoryLfo[li]
+
+                        val lfoActiveGroups = (0..7).filter { lfoGroupActive[li][it] }
+                        // Jeśli KTÓRAKOLWIEK grupa sterowana przez to LFO ma STOP (mult=0),
+                        // całe LFO zamiera w miejscu — tak jak w oryginalnym silniku.
+                        val lfoGroupMult = if (lfoActiveGroups.isNotEmpty()) {
+                            if (lfoActiveGroups.any { Companion.perfGroupTempoMult[it] == 0f }) 0f
+                            else lfoActiveGroups.map { Companion.perfGroupTempoMult[it] }.average().toFloat()
+                        } else 1f
+                        if (lfo.isSync) {
+                            Companion.lfoBeatAccum[li] += baseBeatIncrement * lfoGroupMult
+                            val beats = syncBeats.getOrElse(lfo.syncIdx) { 1f }
+                            val cycleLenBeats = (beats * 2.0).coerceAtLeast(0.001)
+                            val cyclesElapsed = Companion.lfoBeatAccum[li] / cycleLenBeats
+                            lfo.phase = ((cyclesElapsed % 1.0) + 1.0).toFloat() % 1f
+                        } else {
+                            val actualFreq = lfo.rate * lfoGroupMult
+                            lfo.phase += actualFreq * dt.toFloat()
+                            while (lfo.phase >= 1f) lfo.phase -= 1f
+                            while (lfo.phase < 0f) lfo.phase += 1f
+                        }
+
+                        lfo.currentValue = computeWave(lfo.shapeIdx, lfo.phase, lfo.pwm)
+
+                        for (d in 0..3) {
+                            val fId = lfo.fix[d];
+                            val dIdx = lfo.dest[d]
+                            if (fId == -1 || dIdx == -1) continue
+                            val paramName = Companion.paramList.getOrNull(dIdx) ?: continue
+                            // FX target (fId 2000-2003)
+                            if (fId in 2000..2003) {
+                                val fxIdx = fId - 2000
+                                val fxT = Companion.memoryFx[fxIdx]
+                                var fp2 = lfo.phase + lfo.phs[d] / 100f
+                                while (fp2 >= 1f) fp2 -= 1f
+                                while (fp2 < 0f)  fp2 += 1f
+                                val lfoVal = computeWave(lfo.shapeIdx, fp2, lfo.pwm) * lfo.amt[d].toFloat()
+                                when (paramName) {
+                                    "FX_SPD" -> fxT.speed = (Companion.fxBaseSpeeds[fxIdx] + lfoVal * 0.025f).coerceAtLeast(0f)
+                                    "FX_AMT" -> fxT.amt   = (Companion.fxBaseAmts[fxIdx]   + lfoVal.toInt()).coerceIn(-255, 255)
+                                    "FX_PHS" -> fxT.phs   = ((Companion.fxBasePhss[fxIdx]  + lfoVal.toInt()) % 360 + 360) % 360
+                                }
+                                continue
+                            }
+
+                            val groupIdx = when {
+                                fId in 1000..1007 -> fId - 1000
+                                else -> Companion.fixturesList.find { it.id == fId }?.groupIdx ?: -1
+                            }
+                            if (groupIdx < 0) continue
+
+                            // Jeśli grupa nieaktywna – zwolnij kanały i pomiń
+                            if (!lfoGroupActive[li][groupIdx]) {
+                                val fixesOff = if (fId in 1000..1007)
+                                    Companion.fixturesList.filter { it.groupIdx == fId - 1000 }
+                                else listOfNotNull(Companion.fixturesList.find { it.id == fId })
+                                fixesOff.forEach { fix ->
+                                    for (ch in 0 until fix.channels) {
+                                        if (fix.paramMap[ch] == paramName) {
+                                            val actCh = fix.dmx - 1 + ch
+                                            if (actCh in 0..511) Companion.effectManagedChannels[actCh] =
+                                                false
+                                        }
+                                    }
+                                }
+                                continue
+                            }
+
+                            val targetAmt = lfo.amt[d].toFloat()
+
+
+
+                            val presetTouchesThisGroup = groupIdx in 0..7 &&
+                                    Companion.groupRouting[groupIdx] == (if (lfoTarget[li] == 1) 1 else 0)
+                            val isFadingForThisLfo = if (lfoTarget[li] == 1) Companion.isFadingAux else Companion.isFadingMain
+                            val fadeTimeForThisLfo = if (lfoTarget[li] == 1) Companion.currentFadeTimeAux else Companion.currentFadeTimeMain
+                            val fadeTimerForThisLfo = if (lfoTarget[li] == 1) Companion.currentFadeTimerAux else Companion.currentFadeTimerMain
+
+                            if (paramName in lfoFadeParams && isFadingForThisLfo && presetTouchesThisGroup) {
+                                val progress = if (fadeTimeForThisLfo > 0f)
+                                    (fadeTimerForThisLfo / fadeTimeForThisLfo).coerceIn(0f, 1f)
+                                else 1f
+                                lfo.destSmoothed[d] = targetAmt * progress
+                            } else {
+                                lfo.destSmoothed[d] = targetAmt
+                            }
+                            val amtMult = lfo.destSmoothed[d]
+                            val phsVal = lfo.phs[d]
+
+                            val fixes = if (fId in 1000..1007)
+                                Companion.fixturesList.filter { it.groupIdx == fId - 1000 }
+                            else
+                                listOfNotNull(Companion.fixturesList.find { it.id == fId })
+
+                            val fixCount = fixes.size
+
+                            fixes.forEachIndexed { fixIdx, fix ->
+                                var fp = lfo.phase + when {
+                                    phsVal >= 0 -> phsVal / 100f
+                                    fixCount > 0 -> -(-phsVal / 100f) * fixIdx.toFloat() / fixCount
+                                    else -> 0f
+                                }
+                                while (fp >= 1f) fp -= 1f
+                                while (fp < 0f) fp += 1f
+
+                                var fixVal = computeWave(lfo.shapeIdx, fp, lfo.pwm)
+
+                                if (lfo.fad[d] > 0 && (lfo.shapeIdx == 2 || lfo.shapeIdx == 3)) {
+                                    val fadeTime = lfo.fad[d] * 0.05f
+                                    val maxDelta = dt.toFloat() / fadeTime
+                                    val cur = lfo.fixSmoothed[d][fixIdx]
+                                    lfo.fixSmoothed[d][fixIdx] = when {
+                                        fixVal > cur -> (cur + maxDelta).coerceAtMost(fixVal)
+                                        fixVal < cur -> (cur - maxDelta).coerceAtLeast(fixVal)
+                                        else -> fixVal
+                                    }
+                                    fixVal = lfo.fixSmoothed[d][fixIdx]
+                                } else {
+                                    lfo.fixSmoothed[d][fixIdx] = fixVal
+                                }
+
+                                val modVal = lfo.off[d] + (fixVal * amtMult).toInt()
+
+                                for (ch in 0 until fix.channels) {
+                                    if (fix.paramMap[ch] == paramName) {
+                                        val actCh = fix.dmx - 1 + ch
+                                        if (actCh in 0..511) {
+                                            lfoAccum[actCh] += modVal
+                                            lfoTouched[actCh] = true
+                                            synchronized(Companion.effectFlagsLock) { Companion.effectManagedChannels[actCh] = true }
+                                            Companion.lfoCurrentPhases[li] = lfo.phase
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // ── APLIKACJA SUMY WSZYSTKICH LFO (addytywnie) ───────
+                    for (ch in 0..511) {
+                        if (!lfoTouched[ch]) continue
+                        val isDimmer = Companion.fixturesList.any { fix ->
+                            val lc = ch - (fix.dmx - 1)
+                            lc in 0 until fix.channels && fix.paramMap[lc] == "Dimmer"
+                        }
+                        val fv = if (isDimmer) {
+                            // Suwak dimmera = master scale: LFO 0..255 skalowane przez baseDmxValues.
+                            // Suwak na 0 → ciemno zawsze. Suwak na 255 → pełna amplituda LFO.
+                            val lfoOut = lfoAccum[ch].toInt().coerceIn(0, 255)
+                            (lfoOut * Companion.baseDmxValues[ch] / 255.0f).toInt().coerceIn(0, 255)
+                        } else {
+                            val base = Companion.presetDmxValues[ch]
+                            (base + lfoAccum[ch]).toInt().coerceIn(0, 255)
+                        }
+                        Companion.lfoOutputValues[ch] = fv
+                        Companion.dmxValues[ch] = fv
+                        setDmxChannel(ch, fv)
+                    }
+// Zwolnij kanały które LFO przestało dotykać (np. po usunięciu dest)
+                    for (ch in 0..511) {
+                        if (lfoTouched[ch]) continue
+                        if (!Companion.effectManagedChannels[ch]) continue
+                        // Zostaw jeśli SEQ zarządza tym kanałem
+                        val seqManages = Companion.fixturesList.any { fix ->
+                            val lc = ch - (fix.dmx - 1)
+                            if (lc !in 0 until fix.channels) return@any false
+                            (0..3).any { si -> seqEnabled[si] && seqGroupActive[si][fix.groupIdx] }
+                        }
+                        if (!seqManages) Companion.effectManagedChannels[ch] = false
+                    }
+                    // ── KONIEC SILNIKA LFO ───────────────────────────────// ── KONIEC SILNIKA LFO ───────────────────────────────
+
+                    // ── EXT color routing ────────────────────────────────
+                    if (Companion.extColorRouting in 1..4) {
+                        val srcIdx = Companion.extColorRouting - 1
+                        if (seqEnabled[srcIdx]) {
+                            val sq = memorySeq[srcIdx]
+                            val curType = sq.stepType[sq.currentStep]
+                            val prevType = sq.stepType[sq.prevStep]
+                            if (curType == 1 || prevType == 1) {
+                                // Oblicz crossfadeMix tak samo jak w silniku SEQ
+                                val fadeVal = if (sq.stepFade[sq.currentStep] >= 0) sq.stepFade[sq.currentStep] else sq.globalFade
+                                val stepDur = if (sq.stepTime[sq.currentStep] > 0f) sq.stepTime[sq.currentStep].toDouble() else sq.globalTime.toDouble()
+                                val crossfadeMix: Float = if (fadeVal in 1..25) {
+                                    val fadeTime = (stepDur * fadeVal / 25.0).toFloat().coerceAtLeast(0.01f)
+                                    (sq.stepTimer / fadeTime).coerceIn(0f, 1f)
+                                } else 1f
+
+                                val curDmx = if (curType == 1)
+                                    Companion.getPaletteDmxValues(sq.stepValue[sq.currentStep])
+                                else IntArray(6) { 0 }
+
+                                val prevDmx = if (prevType == 1)
+                                    Companion.getPaletteDmxValues(sq.stepValue[sq.prevStep])
+                                else Companion.extColorDmxValues.clone()
+
+                                for (c in 0 until 6) {
+                                    Companion.extColorDmxValues[c] = (prevDmx[c] + (curDmx[c] - prevDmx[c]) * crossfadeMix).toInt().coerceIn(0, 255)
+                                }
+                            }
+                        }
+                    }
+
+
+
+
+                    // ── SILNIK SEQ ──────────────────────────────────────
+                    val seqColorParams = setOf(
+                        "Red","Green","Blue","White","Amber","UV","Col. wheel",
+                        "Beam 1R","Beam 1G","Beam 1B","Beam 1W","Beam 1A",
+                        "Beam 2R","Beam 2G","Beam 2B","Beam 2W","Beam 2A",
+                        "Beam 3R","Beam 3G","Beam 3B","Beam 3W","Beam 3A",
+                        "Beam 4R","Beam 4G","Beam 4B","Beam 4W","Beam 4A",
+                        "Beam 5R","Beam 5G","Beam 5B","Beam 5W","Beam 5A",
+                        "Beam 6R","Beam 6G","Beam 6B","Beam 6W","Beam 6A",
+                        "Beam 7R","Beam 7G","Beam 7B","Beam 7W","Beam 7A",
+                        "Beam 8R","Beam 8G","Beam 8B","Beam 8W","Beam 8A",
+                        "Beam 9R","Beam 9G","Beam 9B","Beam 9W","Beam 9A",
+                        "Beam 10R","Beam 10G","Beam 10B","Beam 10W","Beam 10A"
+                    )
+                    val lfoControlledMovParams = setOf("Zoom", "Focus", "Iris")
+                    val lfoControlledGroupParams = HashSet<String>()
+                    for (li in 0..3) {
+                        if (!lfoEnabled[li]) continue
+                        val lfoC = memoryLfo[li]
+                        for (d in 0..3) {
+                            val fIdC = lfoC.fix[d]; val dIdxC = lfoC.dest[d]
+                            if (fIdC == -1 || dIdxC == -1) continue
+                            val pNameC = Companion.paramList.getOrNull(dIdxC) ?: continue
+                            if (pNameC !in lfoControlledMovParams) continue
+                            val gIdxC = when {
+                                fIdC in 1000..1007 -> fIdC - 1000
+                                else -> Companion.fixturesList.find { it.id == fIdC }?.groupIdx ?: -1
+                            }
+                            if (gIdxC < 0) continue
+                            if (!lfoGroupActive[li][gIdxC]) continue
+                            lfoControlledGroupParams.add("${gIdxC}_$pNameC")
+                        }
+                    }
+                    for (si in 0..3) {
+                        if (!seqEnabled[si]) continue
+                        val seq = memorySeq[si]
+                        if (seq.totalSteps == 0) continue
+                        val seqHasPositionSteps = (0 until seq.totalSteps).any { seq.stepType[it] == 3 }
+                        // 1. Czas trwania bieżącego kroku
+                        val rawTime = seq.stepTime[seq.currentStep]
+                        val stepDurRaw: Float = when {
+                            rawTime == -1f -> 99999f  // STATIC – krok nie przechodzi
+                            seq.stepIsSync[seq.currentStep] -> {
+                                val beats =
+                                    syncBeats.getOrElse(seq.stepSyncIdx[seq.currentStep]) { 1f }
+                                beats * (60f / masterBpm)
+                            }
+                            rawTime > 0f -> rawTime
+                            seq.isSync -> {
+                                val beats = syncBeats.getOrElse(seq.syncIdx) { 1f }
+                                beats * (60f / masterBpm)
+                            }
+                            else -> if (seq.globalTime == -1f) 99999f else seq.globalTime.coerceAtLeast(0.025f)
+                        }.coerceAtLeast(0.025f)
+                        val seqActiveGroups = (0..7).filter { seqGroupActive[si][it] }
+                        // SEQ sterujący EXT color (Companion.extColorRouting wskazuje na ten slot)
+                        // nie ma żadnych aktywnych kafelków grup, więc nie jest objęty STOP per-grupowym.
+                        // Domyślnie ma się zatrzymywać razem z globalnym STOP (Performance index 5),
+                        // gdy ten jest aktywny na DOWOLNEJ grupie (traktujemy STOP jako uniwersalny).
+                        val isExtControllerForThisSeq = (Companion.extColorRouting - 1) == si
+                        val stopActiveAnywhere = Companion.perfSettings[5].isActive
+                        val seqStopped = seqActiveGroups.any { Companion.perfGroupTempoMult[it] == 0f } ||
+                                (isExtControllerForThisSeq && stopActiveAnywhere)
+                        val seqGroupMult = if (seqActiveGroups.isNotEmpty())
+                            seqActiveGroups.map { Companion.perfGroupTempoMult[it] }.average().toFloat()
+                        else 1f
+                        val stepDur: Float = if (seqStopped || stepDurRaw >= 99999f) 99999f
+                        else (stepDurRaw / seqGroupMult).coerceAtLeast(0.025f)
+
+                        // Fade-out timer
+                        if (Companion.seqFadeOutActive[si]) {
+                            Companion.seqFadeOutTimer[si] += dt.toFloat()
+                            if (Companion.seqFadeOutTimer[si] >= Companion.seqFadeOutDuration[si]) {
+                                // Koniec fade-out – teraz naprawdę wyłącz
+                                Companion.seqFadeOutActive[si] = false
+                                seqEnabled[si] = false
+                                releaseSeqChannels(si)
+                            }
+                        }
+
+                        val seqFOMult = if (Companion.seqFadeOutActive[si] && Companion.seqFadeOutDuration[si] > 0f)
+                            1f - (Companion.seqFadeOutTimer[si] / Companion.seqFadeOutDuration[si]).coerceIn(0f, 1f)
+                        else 1f
+
+                        // Sekwencer ma tikować zawsze, gdy główny wyłącznik (seqEnabled) jest aktywny –
+                        // niezależnie od tego, czy steruje jakąkolwiek grupą przez kafelki matrycy.
+                        // To jest istotne dla EXT color routing, który czyta stan sekwencera (krok,
+                        // fade, timer) niezależnie od matrycy grup. STOP w Performance wciąż zamraża
+                        // krok, ale tylko dla grup faktycznie nim sterowanych (seqStopped poniżej).
+                        val hasActiveGroup = (0..7).any { seqGroupActive[si][it] }
+
+                        // 2. Tick timera i przejście do następnego kroku
+                        if (seq.isSync && seq.totalSteps > 0) {
+                            if (!seqStopped) Companion.seqBeatAccum[si] += baseBeatIncrement * seqGroupMult
+                            val beats = syncBeats.getOrElse(seq.syncIdx) { 1f }
+                            val stepLenBeats = beats.toDouble().coerceAtLeast(0.001)
+                            val stepsElapsed = Companion.seqBeatAccum[si] / stepLenBeats
+                            val newStepCount = stepsElapsed.toLong()
+                            val lastStepCount = Companion.seqPingPongPos[si]
+
+                            if (newStepCount > lastStepCount) {
+                                val advances = (newStepCount - lastStepCount).toInt().coerceAtMost(seq.totalSteps * 2)
+                                Companion.seqPingPongPos[si] = newStepCount
+                                repeat(advances) {
+                                    seq.prevStep = seq.currentStep
+                                    seq.justReset = false
+                                    if (seq.globalPhase == seq.totalSteps && seq.totalSteps > 1) {
+                                        val next = seq.currentStep + Companion.seqPingPongDirection[si]
+                                        when {
+                                            next >= seq.totalSteps -> {
+                                                Companion.seqPingPongDirection[si] = -1
+                                                seq.currentStep = seq.totalSteps - 2
+                                            }
+                                            next < 0 -> {
+                                                Companion.seqPingPongDirection[si] = 1
+                                                seq.currentStep = 1.coerceAtMost(seq.totalSteps - 1)
+                                            }
+                                            else -> seq.currentStep = next
+                                        }
+                                    } else {
+                                        seq.currentStep = (seq.currentStep + 1) % seq.totalSteps
+                                    }
+                                }
+                            }
+                            seq.stepTimer = ((stepsElapsed % 1.0) * stepDur).toFloat()
+
+                        } else if (!seqStopped) {
+                            seq.stepTimer += dt.toFloat()
+                            if (seq.stepTimer >= stepDur) {
+                                seq.prevStep = seq.currentStep
+                                seq.stepTimer = 0.0f
+                                seq.justReset = false
+                                if (seq.globalPhase == seq.totalSteps && seq.totalSteps > 1) {
+                                    val next = seq.currentStep + Companion.seqPingPongDirection[si]
+                                    when {
+                                        next >= seq.totalSteps -> {
+                                            Companion.seqPingPongDirection[si] = -1
+                                            seq.currentStep = seq.totalSteps - 2
+                                        }
+                                        next < 0 -> {
+                                            Companion.seqPingPongDirection[si] = 1
+                                            seq.currentStep = 1.coerceAtMost(seq.totalSteps - 1)
+                                        }
+                                        else -> seq.currentStep = next
+                                    }
+                                } else {
+                                    seq.currentStep = (seq.currentStep + 1) % seq.totalSteps
+                                }
+                            }
+                        }
+
+                        val curStep = seq.currentStep
+                        val prevStep = seq.prevStep
+
+                        // 3. Crossfade mix
+                        val fadeVal =
+                            if (seq.stepFade[curStep] == -1) seq.globalFade else seq.stepFade[curStep]
+                        val crossfadeMix: Float = if (fadeVal in 1..25 && !Companion.seqPingPongJustBounced[si]) {
+                            val fadeTime = (stepDur * fadeVal / 25f).coerceAtLeast(0.01f)
+                            (seq.stepTimer / fadeTime).coerceIn(0f, 1f)
+                        } else {
+                            Companion.seqPingPongJustBounced[si] = false
+                            1f
+                        }
+
+                        // 4. Kolor kroku → [R,G,B,W,A,UV] lub null (transparent)
+                        fun stepRgbwa(stepIdx: Int): IntArray? {
+                            if (stepIdx < 0 || stepIdx >= seq.totalSteps) return null
+                            return when (seq.stepType[stepIdx]) {
+                                1 -> Companion.getPaletteDmxValues(seq.stepValue[stepIdx])
+                                2 -> Companion.extColorDmxValues.clone()
+                                else -> null
+                            }
+                        }
+
+                        // 5. Aplikacja per-fixture z phase offsetem
+                        var globalFixIdx = 0
+                        for (g in 0..7) {
+                            // Buduj listę fixture zgodnie z seqRoutingOrder (kolejność + filtr ON/OFF)
+                            val allGroupFixes = Companion.fixturesList.filter { it.groupIdx == g }
+                            val order = Companion.seqRoutingOrder[g]
+                            val onList = Companion.seqRoutingOn[g]
+                            val groupFixes = if (order.isEmpty() || Companion.seqRoutingMode[g] != 0) {
+                                allGroupFixes
+                            } else {
+                                // SEQ mode: zachowaj kolejność z routingu, pomiń wyłączone
+                                val result = mutableListOf<Companion.FixtureItem>()
+                                order.forEachIndexed { pos, fixId ->
+                                    val isOn = onList.getOrElse(pos) { true }
+                                    if (isOn) {
+                                        allGroupFixes.find { it.id == fixId }?.let { result.add(it) }
+                                    }
+                                }
+                                // Dodaj fixture których nie ma w routingu (nowe, nieznane)
+                                allGroupFixes.forEach { fix ->
+                                    if (order.indexOf(fix.id) == -1) result.add(fix)
+                                }
+                                result
+                            }
+                            if (!seqGroupActive[si][g]) {
+                                globalFixIdx += groupFixes.size
+                                continue
+                            }
+                            groupFixes.forEach { fix ->
+                                val effectivePhase = if (seq.globalPhase == seq.totalSteps) 1 else seq.globalPhase
+                                val phaseOff = if (seq.totalSteps > 0) (globalFixIdx * effectivePhase) % seq.totalSteps else 0
+                                val myStep = (curStep + phaseOff) % seq.totalSteps
+                                val myPrev = if (seq.justReset) -1 else (prevStep + phaseOff) % seq.totalSteps
+
+                                val cCol = stepRgbwa(myStep)
+                                val pCol = if (myPrev >= 0) stepRgbwa(myPrev) else null
+
+
+                                if (cCol != null && !Companion.colorManualOverride[g]) {
+                                    val target = cCol ?: intArrayOf(0, 0, 0, 0, 0, 0)
+                                    // Przy justReset (świeży recall presetu) nie ma realnego "poprzedniego
+                                    // kroku" – myPrev=-1, więc base byłby czarny, a crossfadeMix sekwencera
+                                    // (jego WŁASNY, zwykle krótki czas) rampowałby kolor od czerni w swoim
+                                    // tempie, niezależnie od dłuższego fade presetu. To dawało widoczny
+                                    // błysk/skok przez czerń. Celujemy więc prosto w docelowy kolor kroku
+                                    // i pozwalamy mechanizmowi pomostu (fadeStartVal/fadeRatio) obsłużyć
+                                    // płynne wejście w tempie fade presetu.
+                                    val mixed = if (seq.justReset) {
+                                        IntArray(6) { i -> target[i].coerceIn(0, 255) }
+                                    } else {
+                                        val base = pCol ?: intArrayOf(0, 0, 0, 0, 0, 0)
+                                        IntArray(6) { i ->
+                                            (base[i] + (target[i] - base[i]) * crossfadeMix).toInt()
+                                                .coerceIn(0, 255)
+                                        }
+                                    }
+
+                                    for (ch in 0 until fix.channels) {
+                                        val param = fix.paramMap[ch]
+                                        val actCh = fix.dmx - 1 + ch
+                                        if (actCh !in 0..511) continue
+                                        val v = when (param) {
+                                            "Red", "Beam 1R" -> mixed[0]
+                                            "Green", "Beam 1G" -> mixed[1]
+                                            "Blue", "Beam 1B" -> mixed[2]
+                                            "White", "Beam 1W" -> mixed[3]
+                                            "Amber", "Beam 1A" -> mixed[4]
+                                            "UV" -> mixed[5]
+                                            "Col. wheel" -> {
+                                                val hasRgb =
+                                                    fix.paramMap.contains("Red") || fix.paramMap.contains(
+                                                        "Beam 1R"
+                                                    )
+                                                if (!hasRgb) getClosestWheelDmx(
+                                                    fix,
+                                                    mixed[0],
+                                                    mixed[1],
+                                                    mixed[2]
+                                                ) else -1
+                                            }
+
+                                            else -> -1
+                                        }
+                                        if (v >= 0) {
+                                            val mapped =
+                                                fix.paramMin[ch] + (v * (fix.paramMax[ch] - fix.paramMin[ch]) / 255)
+                                            val baseV = Companion.baseDmxValues[actCh]
+                                            var fadedMapped = (baseV + (mapped - baseV) * seqFOMult).toInt().coerceIn(0, 255)
+                                            // Pomost fade presetu: świeży recall (justReset) z aktywnym fade –
+                                            // jedź liniowo od koloru SPRZED recall do docelowego koloru kroku,
+                                            // w tempie zgodnym z czasem fade presetu. Bierzemy MAIN albo AUX
+                                            // zależnie od tego, którą szynę steruje ten SEQ (Companion.seqTarget).
+                                            val isFadingForThisSeq = if (Companion.seqTarget[si] == 1) Companion.isFadingAux else Companion.isFadingMain
+                                            val fadeTimeForThisSeq = if (Companion.seqTarget[si] == 1) Companion.currentFadeTimeAux else Companion.currentFadeTimeMain
+                                            val fadeTimerForThisSeq = if (Companion.seqTarget[si] == 1) Companion.currentFadeTimerAux else Companion.currentFadeTimerMain
+                                            val fadeStartArrForThisSeq = if (Companion.seqTarget[si] == 1) Companion.baseDmxStartAux else Companion.baseDmxStartMain
+                                            if (isFadingForThisSeq && fadeTimeForThisSeq > 0f) {
+                                                val fadeRatio = (fadeTimerForThisSeq / fadeTimeForThisSeq).coerceIn(0f, 1f)
+                                                val fadeStartVal = fadeStartArrForThisSeq[actCh]
+                                                fadedMapped = (fadeStartVal + (fadedMapped - fadeStartVal) * fadeRatio).toInt().coerceIn(0, 255)
+                                            }
+                                            Companion.dmxValues[actCh] = fadedMapped
+                                            Companion.seqOutputValues[actCh] = fadedMapped
+                                            synchronized(Companion.effectFlagsLock) { Companion.effectManagedChannels[actCh] = true }
+                                            setDmxChannel(actCh, fadedMapped)
+                                        }
+                                    }
+                                } else {
+                                    // Pusty krok – zwolnij kanały kolorów (przezroczystość)
+                                    for (ch in 0 until fix.channels) {
+                                        if (fix.paramMap[ch] in seqColorParams) {
+                                            val actCh2 = fix.dmx - 1 + ch
+                                            if (actCh2 in 0..511) Companion.effectManagedChannels[actCh2] =
+                                                false
+                                        }
+                                    }
+                                }
+
+                                // ── Position step (type 3) – SEQ steruje na żywo tylko Pan/Tilt ──
+                                val posMovSet = setOf(
+                                    "Pan",
+                                    "Pan Fine",
+                                    "Tilt",
+                                    "Tilt Fine"
+                                )
+                                val curPosStep = seq.stepType[myStep] == 3
+                                val prevPosStep = myPrev >= 0 && seq.stepType[myPrev] == 3
+                                val presetFadeRatio = if (seq.justReset && Companion.isFadingMain && Companion.currentFadeTimeMain > 0f)
+                                    (Companion.currentFadeTimerMain / Companion.currentFadeTimeMain).coerceIn(0f,1f)
+                                else 1f
+
+                                if (seqHasPositionSteps && !curPosStep && !prevPosStep) {
+                                    for (ch in 0 until fix.channels) {
+                                        val pn0 = fix.paramMap[ch]
+                                        if (pn0 in posMovSet) {
+                                            if (pn0 in lfoControlledMovParams && lfoControlledGroupParams.contains("${g}_$pn0")) continue
+                                            val actCh2 = fix.dmx - 1 + ch
+                                            if (actCh2 in 0..511) {
+                                                Companion.effectManagedChannels[actCh2] = false
+                                                Companion.posSmoothedValues[actCh2] = -1f
+                                            }
+                                        }
+                                    }
+                                }
+                                if (seqHasPositionSteps && (curPosStep || prevPosStep) && seqStopped) {
+                                    // Zamrożenie: utrzymaj kontrolę nad kanałem i wymuś jawnie zamrożoną wartość,
+                                    // nadpisując to co LFO (które biegnie wcześniej w tym samym ticku) już zapisało.
+                                    for (ch in 0 until fix.channels) {
+                                        val pn0 = fix.paramMap[ch]
+                                        if (pn0 !in posMovSet) continue
+                                        val actCh0 = fix.dmx - 1 + ch
+                                        if (actCh0 !in 0..511) continue
+                                        Companion.effectManagedChannels[actCh0] = true
+                                        val frozenVal = if (Companion.posSmoothedValues[actCh0] >= 0f)
+                                            Companion.posSmoothedValues[actCh0].toInt().coerceIn(0, 255)
+                                        else Companion.baseDmxValues[actCh0]
+                                        Companion.dmxValues[actCh0] = frozenVal
+                                        Companion.seqOutputValues[actCh0] = frozenVal
+                                        setDmxChannel(actCh0, frozenVal)
+                                    }
+                                }
+                                if (seqHasPositionSteps && (curPosStep || prevPosStep) && !seqStopped) {
+                                    val curPos =
+                                        if (curPosStep) Companion.positionMemories[g].getOrNull(seq.stepValue[myStep]) else null
+                                    val prevPos =
+                                        if (prevPosStep) Companion.positionMemories[g].getOrNull(seq.stepValue[myPrev]) else null
+                                    if (curPos?.isSaved == true || prevPos?.isSaved == true) {
+                                        val inertia = (12f * dt.toFloat()).coerceAtMost(1f)
+                                        for (ch in 0 until fix.channels) {
+                                            val pn = fix.paramMap[ch]
+                                            if (pn !in posMovSet) continue
+                                            if (pn in lfoControlledMovParams && lfoControlledGroupParams.contains("${g}_$pn")) continue
+                                            val actCh = fix.dmx - 1 + ch
+                                            if (actCh !in 0..511) continue
+                                            val curVal =
+                                                if (curPos?.isSaved == true) curPos.dmxSnapshot[actCh] else Companion.baseDmxValues[actCh]
+                                            // Cel = interpolacja crossfade między krokami (jak w oryginale C)
+                                            val rawTargetVal: Float = if (crossfadeMix < 1f && !seq.justReset) {
+                                                val prevVal =
+                                                    if (prevPos?.isSaved == true) prevPos.dmxSnapshot[actCh] else Companion.baseDmxValues[actCh]
+                                                prevVal + (curVal - prevVal) * crossfadeMix
+                                            } else curVal.toFloat()
+                                            // Suwak/touchpad dopisuje trwały offset do każdego kroku sekwencera.
+                                            // Zabezpieczenie: offset nie może przekroczyć +-255 (cały zakres DMX),
+                                            // inaczej błędny, jednorazowy skok mógłby "zamrozić" cel na stałe na 0 lub 255.
+                                            val offsetForParam = when (pn) {
+                                                "Pan" -> Companion.posPanOffset[g].coerceIn(-255f, 255f)
+                                                "Tilt" -> Companion.posTiltOffset[g].coerceIn(-255f, 255f)
+                                                else -> 0f
+                                            }
+                                            // LFO na Pan/Tilt dodaje swoją oscylację na wierzch pozycji z sekwencera (sumowanie, nie nadpisanie)
+                                            val lfoAdd = if ((pn == "Pan" || pn == "Tilt") && lfoTouched[actCh]) lfoAccum[actCh] else 0f
+                                            val targetVal = (rawTargetVal + offsetForParam + lfoAdd).coerceIn(0f, 255f)
+                                            if (Companion.posSmoothedValues[actCh] < 0f) {
+                                                Companion.posSmoothedValues[actCh] = Companion.baseDmxValues[actCh].toFloat()
+                                            }
+                                            if (Companion.isFadingMain && Companion.currentFadeTimeMain > 0f) {
+                                                // Trwa fade presetu, a pozycja jeszcze nie dogoniła – jedź liniowo od stanu
+                                                // PRZED recall do AKTUALNEGO celu (krok porusza się naturalnie, niezależnie),
+                                                // z progresem opartym na czasie fade presetu. Krok i kolor idą swoim tempem,
+                                                // pozycja po prostu interpoluje szybciej/wolniej żeby zdążyć na czas.
+                                                val fadeRatio = (Companion.currentFadeTimerMain / Companion.currentFadeTimeMain).coerceIn(0f, 1f)
+                                                val fadeStartVal = Companion.baseDmxStartMain[actCh].toFloat()
+                                                Companion.posSmoothedValues[actCh] = fadeStartVal + (targetVal - fadeStartVal) * fadeRatio
+                                                if (fadeRatio >= 1f) Companion.posFadeActiveSinceReset[g] = false
+                                            } else {
+                                                // Inercja ciągła dogania cel — niezależnie od tego co go zmienia (preset, krok)
+                                                Companion.posSmoothedValues[actCh] += (targetVal - Companion.posSmoothedValues[actCh]) * inertia
+                                            }
+                                            val outVal = Companion.posSmoothedValues[actCh].toInt().coerceIn(0, 255)
+                                            Companion.dmxValues[actCh] = outVal
+                                            Companion.seqOutputValues[actCh] = outVal
+                                            Companion.effectManagedChannels[actCh] = true
+                                            setDmxChannel(actCh, outVal)
+                                        }
+                                    }
+                                }
+                                // ── koniec Position step ─────────────────────────
+
+                                globalFixIdx++
+                            }
+                        }
+
+                        // 6. EX-preset krok – aktywuj bieżący
+                        // Najpierw wyłącz wszystkie EX sterowane przez ten SEQ slot
+                        for (stepIdx in 0 until seq.totalSteps) {
+                            if (seq.stepType[stepIdx] == 4 && stepIdx != curStep) {
+                                val exIdx = seq.stepValue[stepIdx]
+                                if (exIdx in 0..63) {
+                                    val neededByOther = (0..3).any { os ->
+                                        os != si && seqEnabled[os] &&
+                                                memorySeq[os].stepType[memorySeq[os].currentStep] == 4 &&
+                                                memorySeq[os].stepValue[memorySeq[os].currentStep] == exIdx
+                                    }
+                                    if (!neededByOther) Companion.activeExPresets[exIdx] = false
+                                }
+                            }
+                        }
+                        // Krok PATT – ustaw routing grupy zgodnie z zapisanym patternem
+                        if (seq.stepType[curStep] == 5) {
+                            val patG  = seq.stepValue[curStep] / 6
+                            val patPi = seq.stepValue[curStep] % 6
+                            val pat = Companion.seqPatternMemories.getOrNull(patG)?.getOrNull(patPi)
+                            if (pat != null && pat.isSaved) {
+                                // Zastosuj tylko jeśli zmienił się krok (nie co tick)
+                                val prevType = seq.stepType[prevStep]
+                                val prevVal  = seq.stepValue[prevStep]
+                                if (prevType != 5 || prevVal != seq.stepValue[curStep]) {
+                                    Companion.seqRoutingOrder[patG].clear()
+                                    Companion.seqRoutingOrder[patG].addAll(pat.order)
+                                    Companion.seqRoutingOn[patG].clear()
+                                    Companion.seqRoutingOn[patG].addAll(pat.onList)
+                                    Companion.seqActivePattern[patG] = patPi
+                                }
+                            }
+                        }
+
+                        if (seq.stepType[curStep] == 4) {
+                            val exIdx = seq.stepValue[curStep]
+                            if (exIdx in 0..63 && Companion.memoryExPresets[exIdx].isSaved) {
+                                val ep = Companion.memoryExPresets[exIdx]
+                                val anyGroupMatch = (0..3).any { j ->
+                                    val fId = ep.exFix[j]
+                                    if (fId == -1) return@any false
+                                    if (fId >= 3000) return@any true  // SEQ/LFO/specjalne – zawsze aktywuj
+                                    val groupIdx = if (fId in 1000..1007) fId - 1000
+                                    else Companion.fixturesList.find { it.id == fId }?.groupIdx ?: return@any false
+                                    seqGroupActive[si][groupIdx]
+                                }
+                                if (anyGroupMatch) Companion.activeExPresets[exIdx] = true
+                            }
+                        }
+                    }
+                    // ── KONIEC SILNIKA SEQ ───────────────────────────────
+
+                    // ── COMET ENGINE ─────────────────────────────────────
+                    val cometColorParams = setOf(
+                        "Red", "Green", "Blue", "White", "Amber", "UV", "Dimmer",
+                        "Beam 1R", "Beam 1G", "Beam 1B", "Beam 1W", "Beam 1A",
+                        "Beam 2R", "Beam 2G", "Beam 2B", "Beam 2W", "Beam 2A",
+                        "Beam 3R", "Beam 3G", "Beam 3B", "Beam 3W", "Beam 3A",
+                        "Beam 4R", "Beam 4G", "Beam 4B", "Beam 4W", "Beam 4A"
+                    )
+                    Companion.fixturesList.forEach { fix ->
+                        val g = fix.groupIdx
+                        val activeSeqIdx = (0..3).firstOrNull { si -> seqEnabled[si] && seqGroupActive[si][g] }
+                        val currentFVal = if (activeSeqIdx != null) {
+                            val sq = memorySeq[activeSeqIdx]
+                            if (sq.stepFade[sq.currentStep] == -1) sq.globalFade else sq.stepFade[sq.currentStep]
+                        } else 0
+
+                        for (ch in 0 until fix.channels) {
+                            val param = fix.paramMap[ch]
+                            if (param !in cometColorParams) continue
+                            val actCh = fix.dmx - 1 + ch
+                            if (actCh !in 0..511) continue
+                            val targetVal = Companion.dmxValues[actCh].toFloat()
+
+                            // Floor: gdy SEQ zarządza kanałem = trzymaj targetVal,
+                            // gdy nie zarządza = zanikaj do tła (presetDmxValues)
+                            val floor = if (Companion.effectManagedChannels[actCh])
+                                targetVal
+                            else
+                                Companion.presetDmxValues[actCh].toFloat()
+
+                            when {
+                                currentFVal == 0 -> {
+                                    // Brak ogona – natychmiastowe przejście do floor
+                                    dmxPersist[actCh] = floor
+                                }
+                                currentFVal in 1..25 && dmxPersist[actCh] > floor -> {
+                                    val sq2 = if (activeSeqIdx != null) memorySeq[activeSeqIdx] else null
+                                    val stepDurC2 = if (sq2 != null) {
+                                        val rT = sq2.stepTime[sq2.currentStep]
+                                        when {
+                                            sq2.stepIsSync[sq2.currentStep] -> syncBeats.getOrElse(sq2.stepSyncIdx[sq2.currentStep]) { 1f } * (60f / masterBpm)
+                                            rT == -1f -> 99999f
+                                            rT > 0f -> rT
+                                            sq2.isSync -> syncBeats.getOrElse(sq2.syncIdx) { 1f } * (60f / masterBpm)
+                                            sq2.globalTime == -1f -> 99999f
+                                            else -> sq2.globalTime.coerceAtLeast(0.025f)
+                                        }
+                                    } else 0.5f
+                                    val tailTime = (stepDurC2 * currentFVal / 12.5f).coerceAtLeast(0.025f)
+                                    val fallSpeed = 255f / tailTime
+                                    dmxPersist[actCh] -= fallSpeed * dt.toFloat()
+                                    if (dmxPersist[actCh] < floor) dmxPersist[actCh] = floor
+                                }
+                                currentFVal > 25 && dmxPersist[actCh] > floor -> {
+                                    val sq = if (activeSeqIdx != null) memorySeq[activeSeqIdx] else null
+                                    val totalSteps = sq?.totalSteps?.coerceAtLeast(1) ?: 1
+                                    val stepDurC = if (sq != null) {
+                                        val rT = sq.stepTime[sq.currentStep]
+                                        when {
+                                            sq.stepIsSync[sq.currentStep] -> syncBeats.getOrElse(sq.stepSyncIdx[sq.currentStep]) { 1f } * (60f / masterBpm)
+                                            rT == -1f -> 99999f
+                                            rT > 0f -> rT
+                                            sq.isSync -> syncBeats.getOrElse(sq.syncIdx) { 1f } * (60f / masterBpm)
+                                            sq.globalTime == -1f -> 99999f
+                                            else -> sq.globalTime.coerceAtLeast(0.025f)
+                                        }
+                                    } else 0.5f
+                                    val cycleDur = (totalSteps * stepDurC).coerceAtLeast(0.025f)
+                                    val ratio = (currentFVal - 26) / 74f
+                                    val tailTime = cycleDur * (0.15f + ratio * 2.85f)
+                                    val fallSpeed = 255f / tailTime
+                                    dmxPersist[actCh] -= fallSpeed * dt.toFloat()
+                                    if (dmxPersist[actCh] < floor) dmxPersist[actCh] = floor
+                                }
+                                else -> {
+                                    // dmxPersist <= floor: ustaw na floor
+                                    dmxPersist[actCh] = floor
+                                }
+                            }
+
+                            val out = dmxPersist[actCh].toInt().coerceIn(0, 255)
+                            Companion.dmxValues[actCh] = out
+                            setDmxChannel(actCh, out)
+                        }
+                    }
+                    // ── KONIEC COMET ENGINE ───────────────────────────────
+                    // ── FX ENGINE ──────────────────────────────────────
+                    fun lfoMod(idx: Int): Float {
+                        if (idx < 0) return 0f
+                        val lfo = memoryLfo[idx]
+                        return computeWave(lfo.shapeIdx, Companion.lfoCurrentPhases[idx], 50)
+                    }
+
+                    // Inkrementuj timery fade FX raz na tick (poza pętlą fi – inaczej 4x za szybko)
+                    val dtF = dt.toFloat()
+                    for (fi in 0..3) {
+                        if (Companion.fxFadeTimer[fi] < Companion.fxFadeTime[fi]) {
+                            Companion.fxFadeTimer[fi] = (Companion.fxFadeTimer[fi] + dtF).coerceAtMost(Companion.fxFadeTime[fi])
+                        }
+                        if (Companion.fxDisableDelay[fi] > 0f) {
+                            Companion.fxDisableDelay[fi] -= dtF
+                            if (Companion.fxDisableDelay[fi] <= 0f) {
+                                Companion.fxDisableDelay[fi] = 0f
+                                Companion.memoryFx[fi].isEnabled = false
+                                Companion.memoryFx[fi].amt = 0
+                            }
+                        }
+                    }
+                    for (fi in 0..3) {
+                        val fx = Companion.memoryFx[fi]
+
+                        // Ghost fix: zwolnij stare kanały gdy dest/group się zmieniły
+                        if (fx.prevDestIdx != fx.destIdx || fx.prevGroupIdx != fx.groupIdx) {
+                            if (fx.prevDestIdx != -1) {
+                                val oldParam = Companion.paramList.getOrNull(fx.prevDestIdx)
+                                Companion.fixturesList.filter { it.groupIdx == fx.prevGroupIdx }.forEach { fix ->
+                                    for (ch in 0 until fix.channels) if (fix.paramMap[ch] == oldParam) {
+                                        val actCh = fix.dmx - 1 + ch
+                                        if (actCh in 0..511) Companion.effectManagedChannels[actCh] = false
+                                    }
+                                }
+                            }
+                            fx.prevDestIdx  = fx.destIdx
+                            fx.prevGroupIdx = fx.groupIdx
+                        }
+
+                        val fxFadingOut = !fx.isEnabled && fx.destIdx != -1 &&
+                                Companion.fxFadeTime[fi] > 0f && Companion.fxFadeTimer[fi] < Companion.fxFadeTime[fi]
+                        if (!fxFadingOut && (!fx.isEnabled || fx.destIdx == -1)) {
+                            val p = Companion.paramList.getOrNull(fx.destIdx) ?: continue
+                            Companion.fixturesList.filter { it.groupIdx == fx.groupIdx }.forEach { fix ->
+                                for (ch in 0 until fix.channels) if (fix.paramMap[ch] == p) {
+                                    val actCh = fix.dmx - 1 + ch
+                                    if (actCh in 0..511) Companion.effectManagedChannels[actCh] = false
+                                }
+                            }
+                            continue
+                        }
+
+                        val paramName = Companion.paramList.getOrNull(fx.destIdx) ?: continue
+                        val groupFixes = Companion.fixturesList.filter { it.groupIdx == fx.groupIdx }
+                        if (groupFixes.isEmpty()) continue
+
+                        // Parametry z modulacją LFO + fade AMT przy zmianie presetu
+
+                        val noteLengths = listOf(0f, 0.0625f, 0.125f, 0.25f, 0.5f, 4f/6f, 1f, 4f/3f, 2f, 4f, 8f, 12f, 16f)
+                        val effSpeed = if (fx.isSync) {
+                            val beatLen = noteLengths.getOrElse(fx.syncIdx) { 1f }
+                            if (beatLen <= 0f) 0f else (Companion.masterBpm / 60f) / beatLen
+                        } else fx.speed
+                        val effAmt = if (Companion.fxFadeTime[fi] > 0f && Companion.fxFadeTimer[fi] < Companion.fxFadeTime[fi]) {
+                            val ratio = (Companion.fxFadeTimer[fi] / Companion.fxFadeTime[fi]).coerceIn(0f, 1f)
+                            (Companion.fxAmtStart[fi] + (fx.amt - Companion.fxAmtStart[fi]) * ratio).toInt()
+                        } else fx.amt
+                        val effPhs   = fx.phs.toFloat()
+
+                        // Przesuń fazę
+                        if (fx.playState != 0) {
+                            val dir = if (fx.playState == 2) -1f else 1f
+                            fx.phase += dir * effSpeed * dt.toFloat()
+                            while (fx.phase >= 1f) fx.phase -= 1f
+                            while (fx.phase < 0f)  fx.phase += 1f
+                        }
+
+                        val spread = fx.spread.coerceAtLeast(1).toFloat()
+                        val phsOff = effPhs / 360f
+
+                        groupFixes.forEachIndexed { idx, fix ->
+                            var fixPhase = fx.phase + idx / spread + phsOff
+                            while (fixPhase >= 1f) fixPhase -= 1f
+                            while (fixPhase < 0f)  fixPhase += 1f
+                            val waveVal      = computeWave(fx.shapeIdx, fixPhase, 50)
+                            val contribution = (waveVal * effAmt).toInt()
+                            for (ch in 0 until fix.channels) {
+                                if (fix.paramMap[ch] != paramName) continue
+                                val actCh = fix.dmx - 1 + ch
+                                if (actCh !in 0..511) continue
+                                // Podczas fade-out FX: base powinien być 0 (efekt gaśnie do zera),
+                                // nie wartość nowego presetu — inaczej contribution jest dodawane
+                                // na wierzch już zmienionego koloru.
+                                val base  = if (fxFadingOut) 0 else Companion.presetDmxValues[actCh]
+                                val lfoContribution = if (lfoTouched[actCh]) lfoAccum[actCh] else 0f
+                                val fxOut = (base + lfoContribution + contribution).toInt().coerceIn(0, 255)
+                                Companion.lfoOutputValues[actCh] = fxOut
+                                Companion.dmxValues[actCh] = fxOut
+                                // Podczas fade-out też trzymaj kanał – inaczej refreshDmxOutput
+                                // nadpisze go wartością nowego presetu zanim fade się skończy.
+                                Companion.effectManagedChannels[actCh] = true
+                                setDmxChannel(actCh, fxOut)
+                            }
+                        }
+                    }
+                    // ── KONIEC FX ENGINE ─────────────────────────────────
+
+
+                    // ── EX-presety ZAWSZE NA WIERZCHU (po SEQ) ─────────────
+
+
+                    val exFadeParams = setOf(
+                        "Pan", "Pan Fine", "Tilt", "Tilt Fine", "Zoom", "Focus", "Iris", "PT speed",
+                        "Red", "Green", "Blue", "White", "Amber", "UV", "Dimmer",
+                        "Beam 1R", "Beam 1G", "Beam 1B", "Beam 1W", "Beam 1A",
+                        "Beam 2R", "Beam 2G", "Beam 2B", "Beam 2W", "Beam 2A",
+                        "Beam 3R", "Beam 3G", "Beam 3B", "Beam 3W", "Beam 3A",
+                        "Beam 4R", "Beam 4G", "Beam 4B", "Beam 4W", "Beam 4A"
+                    )
+                    // ── EX-presety ZAWSZE NA WIERZCHU (po SEQ) ─────────────
+                    for (exIdx in 0 until 64) {
+                        val nowActive = Companion.activeExPresets[exIdx]
+                        val wasActive = exPrevActive[exIdx]
+                        val ep = Companion.memoryExPresets[exIdx]
+                        val fadeTimeSec = if (ep.fadeTime == 0) 0.1f else ep.fadeTime / 10f
+
+                        fun collectCurrentDmx(dest: IntArray) {
+                            for (j in 0..3) {
+                                val fId = ep.exFix[j];
+                                val dIdx = ep.exDest[j]
+                                if (fId == -1 || dIdx == -1) {
+                                    dest[j] = 0; continue
+                                }
+                                val paramName = Companion.paramList.getOrNull(dIdx) ?: ""; dest[j] =
+                                    0
+                                val fix =
+                                    if (fId in 1000..1007) Companion.fixturesList.firstOrNull { it.groupIdx == (fId - 1000) }
+                                    else Companion.fixturesList.find { it.id == fId }
+                                fix?.let { f ->
+                                    val ci = f.paramMap.indexOf(paramName); if (ci != -1) {
+                                    val a = f.dmx - 1 + ci; if (a in 0..511) dest[j] =
+                                        Companion.dmxValues[a]
+                                }
+                                }
+                            }
+                        }
+
+                        // Nowa aktywacja
+                        if (nowActive && !wasActive) {
+                            captureExSlotSnapshot(exIdx, ep)
+                            exFadeTimers[exIdx] = 0f
+                            exFadingOut[exIdx] = false
+                            for (j in 0..3) {
+                                val fId = ep.exFix[j];
+                                val dIdx = ep.exDest[j]
+                                if (fId == -1 || dIdx == -1) {
+                                    exFadeStart[exIdx][j] = 0; continue
+                                }
+                                val paramName = Companion.paramList.getOrNull(dIdx) ?: ""
+                                val fix =
+                                    if (fId in 1000..1007) Companion.fixturesList.firstOrNull { it.groupIdx == (fId - 1000) }
+                                    else Companion.fixturesList.find { it.id == fId }
+                                fix?.let { f ->
+                                    val ci = f.paramMap.indexOf(paramName); if (ci != -1) {
+                                    val a = f.dmx - 1 + ci; exFadeStart[exIdx][j] =
+                                        if (a in 0..511) Companion.baseDmxValues[a] else 0
+                                }
+                                }
+                            }
+                        }
+
+                        // Deaktywacja – start fade-out (użyj wartości docelowej EX jako startu)
+                        if (!nowActive && wasActive && !exFadingOut[exIdx]) {
+                            restoreExSlotSnapshot(exIdx, ep)
+                            exFadingOut[exIdx] = true
+                            exFadeOutTimers[exIdx] = 0f
+                            for (j in 0..3) {
+                                val fId = ep.exFix[j];
+                                val dIdx = ep.exDest[j];
+                                val vVal = ep.exVal[j]
+                                if (fId == -1 || dIdx == -1) {
+                                    exFadeOutStart[exIdx][j] = 0; continue
+                                }
+                                val fix =
+                                    if (fId in 1000..1007) Companion.fixturesList.firstOrNull { it.groupIdx == (fId - 1000) }
+                                    else Companion.fixturesList.find { it.id == fId }
+                                val paramName = Companion.paramList.getOrNull(dIdx)
+                                    ?: ""; exFadeOutStart[exIdx][j] = 0
+                                fix?.let { f ->
+                                    val ci = f.paramMap.indexOf(paramName); if (ci != -1) {
+                                    exFadeOutStart[exIdx][j] =
+                                        f.paramMin[ci] + (vVal * (f.paramMax[ci] - f.paramMin[ci]) / 255)
+                                }
+                                }
+                            }
+                        }
+
+                        exPrevActive[exIdx] = nowActive
+                        if (nowActive) applyExSlotSpecial(ep)
+
+                        // Fade-out w toku
+                        if (exFadingOut[exIdx]) {
+                            exFadeOutTimers[exIdx] += dt.toFloat()
+                            val outRatio =
+                                (1f - exFadeOutTimers[exIdx] / fadeTimeSec).coerceIn(0f, 1f)
+                            if (exFadeOutTimers[exIdx] >= fadeTimeSec) {
+                                exFadingOut[exIdx] = false
+                                for (j in 0..3) {
+                                    val fId = ep.exFix[j]; val dIdx = ep.exDest[j]; val vVal = ep.exVal[j]
+                                    if (fId == -1 || dIdx == -1) continue
+                                    val paramName = Companion.paramList.getOrNull(dIdx) ?: continue
+                                    val fixes =
+                                        if (fId in 1000..1007) Companion.fixturesList.filter { it.groupIdx == (fId - 1000) }
+                                        else listOfNotNull(Companion.fixturesList.find { it.id == fId })
+                                    fixes.forEach { fix ->
+                                        val chIdx =
+                                            fix.paramMap.indexOf(paramName); if (chIdx == -1) return@forEach
+                                        val actCh =
+                                            fix.dmx - 1 + chIdx; if (actCh !in 0..511) return@forEach
+                                        // Filtracja grupowa: EX-preset sterowany przez SEQ
+                                        // działa tylko na grupy z aktywnym kafelkiem tego SEQ.
+                                        // Sprawdzamy czy którykolwiek aktywny SEQ (z tym EX w krokach)
+                                        // ma aktywny kafelek dla grupy tego fixture.
+                                        val groupIdx = fix.groupIdx
+                                        // Filtracja grupowa tylko dla fixture'ów (fId<2000)
+                                        // SEQ/LFO/specjalne (fId>=3000) nie mają groupIdx – zawsze przepuszczaj
+                                        if (fId < 3000) {
+                                            val seqControlled = (0..3).any { si ->
+                                                seqEnabled[si] &&
+                                                        (0 until memorySeq[si].totalSteps).any { s ->
+                                                            memorySeq[si].stepType[s] == 4 &&
+                                                                    memorySeq[si].stepValue[s] == exIdx
+                                                        }
+                                            }
+                                            if (seqControlled) {
+                                                val groupAllowed = (0..3).any { si ->
+                                                    seqEnabled[si] && seqGroupActive[si][groupIdx] &&
+                                                            (0 until memorySeq[si].totalSteps).any { s ->
+                                                                memorySeq[si].stepType[s] == 4 &&
+                                                                        memorySeq[si].stepValue[s] == exIdx
+                                                            }
+                                                }
+                                                if (!groupAllowed) return@forEach
+                                            }
+                                        }
+                                        val mapped =
+                                            fix.paramMin[chIdx] + (vVal * (fix.paramMax[chIdx] - fix.paramMin[chIdx]) / 255)
+                                        val finalVal = if (paramName in exFadeParams) {
+                                            val startV = exFadeStart[exIdx][j]
+                                            (startV + (mapped - startV) * outRatio).toInt()
+                                                .coerceIn(0, 255)
+                                        } else mapped
+                                        Companion.dmxValues[actCh] = finalVal
+                                        setDmxChannel(actCh, finalVal)
+                                    }
+                                }
+                            } else {
+                                for (j in 0..3) {
+                                    val fId = ep.exFix[j];
+                                    val dIdx = ep.exDest[j]
+                                    if (fId == -1 || dIdx == -1) continue
+                                    val paramName = Companion.paramList.getOrNull(dIdx) ?: continue
+                                    if (paramName !in exFadeParams) continue
+                                    val fixes =
+                                        if (fId in 1000..1007) Companion.fixturesList.filter { it.groupIdx == (fId - 1000) }
+                                        else listOfNotNull(Companion.fixturesList.find { it.id == fId })
+                                    fixes.forEach { fix ->
+                                        val chIdx =
+                                            fix.paramMap.indexOf(paramName); if (chIdx == -1) return@forEach
+                                        val actCh =
+                                            fix.dmx - 1 + chIdx; if (actCh !in 0..511) return@forEach
+                                        val groupIdx2 = fix.groupIdx
+                                        val seqControlled2 = (0..3).any { si ->
+                                            seqEnabled[si] &&
+                                                    (0 until memorySeq[si].totalSteps).any { s ->
+                                                        memorySeq[si].stepType[s] == 4 &&
+                                                                memorySeq[si].stepValue[s] == exIdx
+                                                    }
+                                        }
+                                        if (seqControlled2) {
+                                            val groupAllowed2 = (0..3).any { si ->
+                                                seqEnabled[si] && seqGroupActive[si][groupIdx2] &&
+                                                        (0 until memorySeq[si].totalSteps).any { s ->
+                                                            memorySeq[si].stepType[s] == 4 &&
+                                                                    memorySeq[si].stepValue[s] == exIdx
+                                                        }
+                                            }
+                                            if (!groupAllowed2) return@forEach
+                                        }
+                                        val baseV = Companion.baseDmxValues[actCh]
+                                        val startV = exFadeOutStart[exIdx][j]
+                                        val finalVal = (baseV + (startV - baseV) * outRatio).toInt()
+                                            .coerceIn(0, 255)
+                                        Companion.dmxValues[actCh] = finalVal
+                                        setDmxChannel(actCh, finalVal)
+                                    }
+                                }
+                            }
+                            continue  // nie wykonuj fade-in
+                        }
+
+                        // Nie aktywny i nie fade-out – pomiń
+                        if (!nowActive) continue
+
+                        // Fade-in
+                        exFadeTimers[exIdx] =
+                            (exFadeTimers[exIdx] + dt.toFloat()).coerceAtMost(fadeTimeSec)
+                        val fadeRatio =
+                            if (fadeTimeSec > 0f) (exFadeTimers[exIdx] / fadeTimeSec).coerceIn(
+                                0f,
+                                1f
+                            ) else 1f
+
+                        for (j in 0..3) {
+                            val fId = ep.exFix[j];
+                            val dIdx = ep.exDest[j];
+                            val vVal = ep.exVal[j]
+                            if (fId == -1 || dIdx == -1) continue
+                            val paramName = Companion.paramList.getOrNull(dIdx) ?: continue
+                            val fixes =
+                                if (fId in 1000..1007) Companion.fixturesList.filter { it.groupIdx == (fId - 1000) }
+                                else listOfNotNull(Companion.fixturesList.find { it.id == fId })
+                            fixes.forEach { fix ->
+                                val chIdx =
+                                    fix.paramMap.indexOf(paramName); if (chIdx == -1) return@forEach
+                                val actCh =
+                                    fix.dmx - 1 + chIdx; if (actCh !in 0..511) return@forEach
+                                val mapped =
+                                    fix.paramMin[chIdx] + (vVal * (fix.paramMax[chIdx] - fix.paramMin[chIdx]) / 255)
+                                val finalVal = if (paramName in exFadeParams) {
+                                    val startV = exFadeStart[exIdx][j]
+                                    (startV + (mapped - startV) * fadeRatio).toInt()
+                                        .coerceIn(0, 255)
+                                } else mapped
+                                Companion.dmxValues[actCh] = finalVal
+                                setDmxChannel(actCh, finalVal)
+                            }
+                        }
+
+
+                    }
+                    // ── KONIEC EX na wierzchu ────────────────────────────────
+
+                    // ── PERF OVERRIDE (nad wszystkim) ─────────────────────────
+                    for (pi in 0..7) {
+                        val ps = Companion.perfSettings[pi]
+
+                        if (pi in listOf(0,1,2,6)) {
+                            // Aktualizacja timera fade
+                            if (ps.isActive && !ps.wasActivePrev) ps.fadeTimer = 0f
+                            if (!ps.isActive && ps.wasActivePrev) ps.fadeTimer = 0f
+                            ps.wasActivePrev = ps.isActive
+                            if (ps.isActive || ps.fadeTimer < ps.fadeOut) {
+                                ps.fadeTimer += dt.toFloat()
+                            }
+                        }
+                        if (!ps.isActive && pi !in listOf(0,1,2,6)) continue
+                        if (!ps.isActive && pi in listOf(0,1,2,6) && ps.fadeTimer >= ps.fadeOut) continue
+
+                        val fixes = Companion.fixturesList.filter { ps.groupMask[it.groupIdx] }
+                        val fadeRatio = when {
+                            pi !in listOf(0,1,2,6) -> 1f
+                            ps.isActive -> if (ps.fadeIn > 0f) (ps.fadeTimer/ps.fadeIn).coerceIn(0f,1f) else 1f
+                            else -> if (ps.fadeOut > 0f) (1f - (ps.fadeTimer/ps.fadeOut)).coerceIn(0f,1f) else 0f
+                        }
+
+                        when (pi) {
+                            0 -> fixes.forEach { fix -> // BLINDER
+                                for (ch in 0 until fix.channels) {
+                                    val addr = fix.dmx-1+ch; if (addr !in 0..511) continue
+                                    val target = when(fix.paramMap[ch]) {
+                                        "Dimmer" -> fix.paramMin[ch]+(ps.value*(fix.paramMax[ch]-fix.paramMin[ch])/255)
+                                        "Red","Beam 1R","Green","Beam 1G","Blue","Beam 1B",
+                                        "White","Beam 1W","Amber","Beam 1A","UV" -> fix.paramMax[ch]
+                                        else -> -1
+                                    }
+                                    if (target>=0) {
+                                        val base = Companion.baseDmxValues[addr]
+                                        val v = (base + (target-base)*fadeRatio).toInt().coerceIn(0,255)
+                                        Companion.dmxValues[addr]=v; setDmxChannel(addr,v)
+                                    }
+                                }
+                            }
+                            1 -> fixes.forEach { fix -> // STROBE (bez fade)
+                                for (ch in 0 until fix.channels) {
+                                    if (fix.paramMap[ch]=="Shutter") {
+                                        val addr=fix.dmx-1+ch; if (addr !in 0..511) continue
+                                        val v=fix.paramMin[ch]+(ps.value*(fix.paramMax[ch]-fix.paramMin[ch])/255)
+                                        Companion.dmxValues[addr]=v; setDmxChannel(addr,v)
+                                    }
+                                }
+                            }
+                            2 -> { // COLOR
+                                val dmxV = Companion.getPaletteDmxValues(ps.value.coerceIn(0,63))
+                                fixes.forEach { fix ->
+                                    for (ch in 0 until fix.channels) {
+                                        val addr=fix.dmx-1+ch; if (addr !in 0..511) continue
+                                        val v = when(fix.paramMap[ch]) {
+                                            "Red","Beam 1R"->dmxV[0];"Green","Beam 1G"->dmxV[1]
+                                            "Blue","Beam 1B"->dmxV[2];"White","Beam 1W"->dmxV[3]
+                                            "Amber","Beam 1A"->dmxV[4];"UV"->dmxV[5];else->-1
+                                        }
+                                        if (v>=0) {
+                                            val target=fix.paramMin[ch]+(v*(fix.paramMax[ch]-fix.paramMin[ch])/255)
+                                            val base = Companion.baseDmxValues[addr]
+                                            val mapped = (base + (target-base)*fadeRatio).toInt().coerceIn(0,255)
+                                            Companion.dmxValues[addr]=mapped; setDmxChannel(addr,mapped)
+                                        }
+                                    }
+                                }
+                            }
+                            6 -> fixes.forEach { fix -> // BLACKOUT
+                                for (ch in 0 until fix.channels) {
+                                    if (fix.paramMap[ch] != "Dimmer") continue
+                                    val addr=fix.dmx-1+ch; if (addr !in 0..511) continue
+                                    val target = fix.paramMin[ch]
+                                    val base = Companion.baseDmxValues[addr]
+                                    val v = (base + (target-base)*fadeRatio).toInt().coerceIn(0,255)
+                                    Companion.dmxValues[addr]=v; setDmxChannel(addr,v)
+                                }
+                            }
+                        }
+                    }
+                    // ── KONIEC PERF OVERRIDE ──────────────────────────────────
+
+                    // ── SOLO (EDIT) override ──────────────────────────────────
+                    if (posEditMode) {
+                        val editFixes =
+                            Companion.fixturesList.filter { it.groupIdx == posCurrentGroup }
+                        val targets = if (posIsFixtureMode) listOfNotNull(
+                            editFixes.getOrNull(posCurrentFixture - 1)
+                        ) else editFixes
+                        targets.forEach { fix ->
+                            for (ch in 0 until fix.channels) {
+                                val addr = fix.dmx - 1 + ch
+                                if (addr in 0..511) {
+                                    val v = Companion.baseDmxValues[addr]
+                                    if (Companion.dmxValues[addr] != v) {
+                                        Companion.dmxValues[addr] = v; setDmxChannel(addr, v)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // ── KONIEC SOLO ───────────────────────────────────────────
+
+                    if (Companion.isFadingMain) {
+                        Companion.currentFadeTimerMain += dt.toFloat()
+                        if (Companion.currentFadeTimerMain >= Companion.currentFadeTimeMain) {
+                            Companion.currentFadeTimerMain = Companion.currentFadeTimeMain
+                            Companion.isFadingMain = false
+
+                        }
+                    }
+                    if (Companion.isFadingAux) {
+                        Companion.currentFadeTimerAux += dt.toFloat()
+                        if (Companion.currentFadeTimerAux >= Companion.currentFadeTimeAux) {
+                            Companion.currentFadeTimerAux = Companion.currentFadeTimeAux
+                            Companion.isFadingAux = false
+                        }
+                    }
+
+                    // PATT mode: wymuś zero po wszystkich efektach
+                    for (g in 0..7) {
+                        if (Companion.seqRoutingMode[g] != 1) continue
+                        val order = Companion.seqRoutingOrder[g]
+                        val onList = Companion.seqRoutingOn[g]
+                        order.forEachIndexed { pos, fixId ->
+                            if (onList.getOrElse(pos) { true }) return@forEachIndexed
+                            val fix = Companion.fixturesList.find { it.id == fixId } ?: return@forEachIndexed
+                            for (ch in 0 until fix.channels) {
+                                val addr = fix.dmx - 1 + ch
+                                if (addr in 0..511 && Companion.dmxValues[addr] != 0) {
+                                    Companion.dmxValues[addr] = 0
+                                    setDmxChannel(addr, 0)
+                                }
+                            }
+                        }
+                    }
+
+                    delay(25)
+                }
+
+            }
+            activeViewContainer.addView(createColorView())
+        }
+    }
+    // ── MIDI setup ───────────────────────────────────────────────
